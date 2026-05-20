@@ -15,6 +15,8 @@ https://sunday-tracker-live.web.app/?code=coyj4tos
 ### v1
 ~~Version & date~~
 Statut (En cours, en pause, terminé) / jolies icones
+Dégradé de coulur pour voir les 5/10 dernières positions
+
 
 ### v1.1
 Zoom/dézoom
