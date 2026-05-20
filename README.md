@@ -1,17 +1,23 @@
 # sunday_tracker_live
 
-A new Flutter project.
+## Stack
+### Github
+https://github.com/lpujol31/sunday_tracker_live
 
-## Getting Started
 
-This project is a starting point for a Flutter application.
+### Firebase
+https://console.firebase.google.com/project/sunday-tracker-live/overview
 
-A few resources to get you started if this is your first Flutter project:
+https://sunday-tracker-live.web.app
+https://sunday-tracker-live.web.app/?code=coyj4tos
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## Backlog
+### v1
+~~Version & date~~
+Statut (En cours, en pause, terminé) / jolies icones
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+### v1.1
+Zoom/dézoom
+Icone
+Tracé, flèches (sens)
+

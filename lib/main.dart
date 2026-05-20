@@ -1,10 +1,11 @@
-import 'dart:html' as html;
-
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+
+import 'package:intl/intl.dart';
 
 const supabaseUrl = 'https://eltlnrxiuvixjlakjfhz.supabase.co';
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsdGxucnhpdXZpeGpsYWtqZmh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyMDIxMTIsImV4cCI6MjA5NDc3ODExMn0.Udyy_6xF09JArDODJNkF-b-idlw4P-52ByzHilOOwwQ';
@@ -51,15 +52,34 @@ class _LivePageState extends State<LivePage> {
 
   DateTime? lastUpdate;
 
+  String appVersion = '';
+
   final shareCode =
       Uri.base.queryParameters['code'];
 
   @override
   void initState() {
     super.initState();
-
+    
+    loadAppVersion();
     loadLastPosition();
   }
+
+  Future<void> loadAppVersion() async 
+  {
+    final packageInfo = await PackageInfo.fromPlatform();
+
+    final formattedDate = packageInfo.updateTime != null
+        ? DateFormat('dd/MM/yyyy HH:mm').format(packageInfo.updateTime!)
+        : null;
+
+    setState(() {
+      appVersion =
+          'v${packageInfo.version}+${packageInfo.buildNumber}'
+          '${formattedDate != null ? ' - $formattedDate' : ''}';
+    });
+  }
+
 
   Future<void> loadLastPosition() async {
 
@@ -131,19 +151,45 @@ class _LivePageState extends State<LivePage> {
 
     if (errorMessage != null ||
         latitude == null ||
-        longitude == null) {
-
+        longitude == null) 
+    {
       return Scaffold(
-        backgroundColor:
-            const Color(0xFF0D0D0D),
+          backgroundColor: const Color(0xFF0D0D0D),
 
-        body: Center(
-          child: Text(
-            errorMessage ??
-                'Aucune position disponible',
+          body: SafeArea(
+            child: Column(
+              children: [
+                const Spacer(),
+
+                Center(
+                  child: Text(
+                    errorMessage ??
+                        'Aucune position disponible',
+                    style: const TextStyle(
+                      color: Colors.white,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+
+                const Spacer(),
+
+                Padding(
+                  padding: const EdgeInsets.only(
+                    bottom: 12,
+                  ),
+                  child: Text(
+                    appVersion,
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.5),
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
-      );
+        );      
     }
 
     final currentPosition = LatLng(
@@ -307,6 +353,14 @@ class _LivePageState extends State<LivePage> {
                   ),
                 ),
               ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            appVersion,
+            style: const TextStyle(
+              fontSize: 12,
+              color: Colors.white38,
             ),
           ),
         ],
