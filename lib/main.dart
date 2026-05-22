@@ -133,18 +133,16 @@ class _LivePageState extends State<LivePage> {
   Color getStatusColor() {
     switch (rideStatus) {
       case 'in_progress':
-        return const Color(0xFF3B82F6); // bleu
-
+        return const Color(0xFF3B82F6);
       case 'paused':
-        return const Color(0xFFFACC15); // jaune
-
+        return const Color(0xFFFACC15);
       case 'finished':
-        return const Color(0xFF4CAF50); // vert
-
+        return const Color(0xFF4CAF50);
       default:
         return Colors.grey;
     }
   }
+
   String getStatusLabel() {
     switch (rideStatus) {
       case 'in_progress':
@@ -235,6 +233,7 @@ class _LivePageState extends State<LivePage> {
 
     return markers;
   }
+
   Marker buildCurrentPositionMarker(LatLng currentPosition) {
     return Marker(
       point: currentPosition,
@@ -322,6 +321,294 @@ class _LivePageState extends State<LivePage> {
     }
   }
 
+  Widget _buildLocationCard() {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isMobile = screenWidth < 700;
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (!isMobile) ...[
+          Container(
+            width: 72,
+            height: 72,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(20),
+              gradient: LinearGradient(
+                colors: [
+                  Colors.orange.withValues(alpha: 0.25),
+                  Colors.orange.withValues(alpha: 0.08),
+                ],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+            ),
+            child: const Icon(
+              Icons.location_on,
+              color: Colors.orange,
+              size: 40,
+            ),
+          ),
+          const SizedBox(width: 16),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 4,
+                    height: isMobile ? 44 : 52,
+                    decoration: BoxDecoration(
+                      color: Colors.orange,
+                      borderRadius: BorderRadius.circular(20),
+                    ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Dernière position connue',
+                          style: TextStyle(
+                            fontSize: isMobile ? 17 : 20,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Latitude : ${latitude?.toStringAsFixed(6)}',
+                          style: TextStyle(
+                            fontSize: isMobile ? 14 : 16,
+                          ),
+                        ),
+                        Text(
+                          'Longitude : ${longitude?.toStringAsFixed(6)}',
+                          style: TextStyle(
+                            fontSize: isMobile ? 14 : 16,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: isMobile ? double.infinity : null,
+                child: ElevatedButton.icon(
+                  onPressed: () async {
+                    final googleMapsUrl =
+                        'https://www.google.com/maps/search/?api=1&query=$latitude,$longitude';
+
+                    final uri = Uri.parse(googleMapsUrl);
+
+                    if (await canLaunchUrl(uri)) {
+                      await launchUrl(
+                        uri,
+                        mode: LaunchMode.externalApplication,
+                      );
+                    }
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2B2035),
+                    foregroundColor: const Color(0xFFD7B8FF),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: isMobile ? 14 : 18,
+                      vertical: 14,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(30),
+                    ),
+                  ),
+                  icon: const Icon(Icons.map),
+                  label: Text(
+                    isMobile ? 'Google Maps' : 'Ouvrir dans Google Maps',
+                  ),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Row(
+                children: [
+                  const Icon(
+                    Icons.access_time,
+                    color: Colors.white54,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      lastUpdate == null
+                          ? 'Dernière mise à jour inconnue'
+                          : 'Dernière mise à jour : ${DateFormat('dd/MM/yyyy HH:mm:ss').format(lastUpdate!.toLocal())}',
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStatusCard() {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final isMobile = screenWidth < 700;
+
+    return Container(
+      padding: EdgeInsets.symmetric(
+        horizontal: isMobile ? 16 : 26,
+        vertical: isMobile ? 18 : 22,
+      ),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1F1F),
+        borderRadius: BorderRadius.circular(24),
+        border: Border.all(
+          color: getStatusColor(),
+          width: 2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: getStatusColor().withValues(alpha: 0.18),
+            blurRadius: 18,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          Container(
+            width: isMobile ? 64 : 92,
+            height: isMobile ? 64 : 92,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: getStatusColor().withValues(alpha: 0.12),
+              border: Border.all(
+                color: getStatusColor().withValues(alpha: 0.45),
+                width: 2,
+              ),
+            ),
+            child: Icon(
+              getStatusIcon(),
+              color: getStatusColor(),
+              size: isMobile ? 36 : 54,
+            ),
+          ),
+          SizedBox(width: isMobile ? 16 : 24),
+          Expanded(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'STATUT DU RIDE',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.65),
+                    fontSize: isMobile ? 11 : 13,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  getStatusLabel(),
+                  style: TextStyle(
+                    color: getStatusColor(),
+                    fontSize: isMobile ? 24 : 36,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Container(
+                  height: 1,
+                  color: Colors.white.withValues(alpha: 0.08),
+                ),
+                const SizedBox(height: 14),
+                Row(
+                  children: [
+                    Container(
+                      width: 10,
+                      height: 10,
+                      decoration: BoxDecoration(
+                        color: getStatusColor(),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        rideStatus == 'in_progress'
+                            ? 'Le ride est actuellement en cours'
+                            : rideStatus == 'paused'
+                                ? 'Le ride est actuellement en pause'
+                                : rideStatus == 'finished'
+                                    ? 'Le ride est terminé'
+                                    : 'Statut indisponible',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.78),
+                          fontSize: isMobile ? 13 : 15,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBottomPanel() {
+    return Container(
+      width: double.infinity,
+      padding: EdgeInsets.all(
+        MediaQuery.of(context).size.width < 700 ? 14 : 20,
+      ),
+      color: const Color(0xFF1B1B1B),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final isMobile = constraints.maxWidth < 900;
+
+          if (isMobile) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                _buildLocationCard(),
+                const SizedBox(height: 16),
+                _buildStatusCard(),
+              ],
+            );
+          }
+
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                flex: 2,
+                child: _buildLocationCard(),
+              ),
+              const SizedBox(width: 20),
+              Expanded(
+                child: _buildStatusCard(),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (isLoading) {
@@ -340,12 +627,15 @@ class _LivePageState extends State<LivePage> {
             children: [
               const Spacer(),
               Center(
-                child: Text(
-                  errorMessage ?? 'Aucune position disponible',
-                  style: const TextStyle(
-                    color: Colors.white,
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    errorMessage ?? 'Aucune position disponible',
+                    style: const TextStyle(
+                      color: Colors.white,
+                    ),
+                    textAlign: TextAlign.center,
                   ),
-                  textAlign: TextAlign.center,
                 ),
               ),
               const Spacer(),
@@ -372,17 +662,13 @@ class _LivePageState extends State<LivePage> {
       longitude!,
     );
 
-    final firstPoint = tracePoints.isNotEmpty
-        ? tracePoints.first
-        : currentPosition;
+    final firstPoint = tracePoints.isNotEmpty ? tracePoints.first : currentPosition;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0D0D0D),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0D0D0D),
-        title: const Text(
-          'Sunday Tracker Live',
-        ),
+        title: const Text('Sunday Tracker Live'),
         actions: [
           Row(
             children: [
@@ -440,368 +726,81 @@ class _LivePageState extends State<LivePage> {
           ),
         ],
       ),
-      body: Column(
-        children: [
-          Expanded(
-            child: FlutterMap(
-              mapController: mapController,
-              options: MapOptions(
-                initialCenter: currentPosition,
-                initialZoom: 15,
-              ),
-              children: [
-                TileLayer(
-                  urlTemplate:
-                      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  userAgentPackageName:
-                      'com.example.sunday_tracker_live',
+      body: SafeArea(
+        top: false,
+        child: Column(
+          children: [
+            Expanded(
+              child: FlutterMap(
+                mapController: mapController,
+                options: MapOptions(
+                  initialCenter: currentPosition,
+                  initialZoom: 15,
                 ),
-
-                PolylineLayer(
-                  polylines: [
-                    Polyline(
-                      points: tracePoints,
-                      strokeWidth: 5,
-                      color: Colors.orange,
-                    ),
-                  ],
-                ),
-
-                MarkerLayer(
-                  markers: [
-                    ...buildDirectionMarkers(),
-
-                    Marker(
-                      point: firstPoint,
-                      width: 22,
-                      height: 22,
-                      child: Container(
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.25),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: Colors.white,
-                            width: 2,
-                          ),
-                          boxShadow: [
-                            BoxShadow(
-                              color:
-                                  Colors.greenAccent.withValues(alpha: 0.85),
-                              blurRadius: 8,
+                children: [
+                  TileLayer(
+                    urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                    userAgentPackageName: 'com.example.sunday_tracker_live',
+                  ),
+                  PolylineLayer(
+                    polylines: [
+                      Polyline(
+                        points: tracePoints,
+                        strokeWidth: 5,
+                        color: Colors.orange,
+                      ),
+                    ],
+                  ),
+                  MarkerLayer(
+                    markers: [
+                      ...buildDirectionMarkers(),
+                      Marker(
+                        point: firstPoint,
+                        width: 22,
+                        height: 22,
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: Colors.black.withValues(alpha: 0.25),
+                            shape: BoxShape.circle,
+                            border: Border.all(
+                              color: Colors.white,
+                              width: 2,
                             ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    Marker(
-                      point: currentPosition,
-                      width: 34,
-                      height: 34,
-                      child: const Icon(
-                        Icons.location_on,
-                        color: Colors.red,
-                        size: 34,
-                      ),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(20),
-            color: const Color(0xFF1B1B1B),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Expanded(
-                  flex: 2,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        width: 72,
-                        height: 72,
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(20),
-                          gradient: LinearGradient(
-                            colors: [
-                              Colors.orange.withValues(alpha: 0.25),
-                              Colors.orange.withValues(alpha: 0.08),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.greenAccent.withValues(alpha: 0.85),
+                                blurRadius: 8,
+                              ),
                             ],
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
                           ),
                         ),
+                      ),
+                      Marker(
+                        point: currentPosition,
+                        width: 34,
+                        height: 34,
                         child: const Icon(
                           Icons.location_on,
-                          color: Colors.orange,
-                          size: 40,
-                        ),
-                      ),
-
-                      const SizedBox(width: 16),
-
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Container(
-                                  width: 4,
-                                  height: 52,
-                                  decoration: BoxDecoration(
-                                    color: Colors.orange,
-                                    borderRadius: BorderRadius.circular(20),
-                                  ),
-                                ),
-
-                                const SizedBox(width: 14),
-
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      const Text(
-                                        'Dernière position connue',
-                                        style: TextStyle(
-                                          fontSize: 20,
-                                          fontWeight: FontWeight.bold,
-                                        ),
-                                      ),
-
-                                      const SizedBox(height: 2),
-
-                                      Text(
-                                        'Latitude : $latitude',
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                        ),
-                                      ),
-
-                                      Text(
-                                        'Longitude : $longitude',
-                                        style: const TextStyle(
-                                          fontSize: 16,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-
-                            const SizedBox(height: 18),
-
-                            Align(
-                              alignment: Alignment.centerLeft,
-                              child: ElevatedButton.icon(
-                                onPressed: () async {
-                                  final googleMapsUrl =
-                                      'https://www.google.com/maps/search/?api=1&query=$latitude,$longitude';
-
-                                  final uri = Uri.parse(googleMapsUrl);
-
-                                  if (await canLaunchUrl(uri)) {
-                                    await launchUrl(
-                                      uri,
-                                      mode: LaunchMode.externalApplication,
-                                    );
-                                  }
-                                },
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: const Color(0xFF2B2035),
-                                  foregroundColor: const Color(0xFFD7B8FF),
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 18,
-                                    vertical: 14,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(30),
-                                  ),
-                                ),
-                                icon: const Icon(Icons.map),
-                                label: const Text(
-                                  'Ouvrir dans Google Maps',
-                                ),
-                              ),
-                            ),
-
-                            const SizedBox(height: 14),
-
-                            Row(
-                              children: [
-                                const Icon(
-                                  Icons.access_time,
-                                  color: Colors.white54,
-                                  size: 16,
-                                ),
-
-                                const SizedBox(width: 8),
-
-                                Expanded(
-                                  child: Text(
-                                    lastUpdate == null
-                                        ? 'Dernière mise à jour inconnue'
-                                        : 'Dernière mise à jour : ${DateFormat('dd/MM/yyyy HH:mm:ss').format(lastUpdate!.toLocal())}',
-                                    style: const TextStyle(
-                                      color: Colors.white70,
-                                      fontSize: 12,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ],
+                          color: Colors.red,
+                          size: 34,
                         ),
                       ),
                     ],
                   ),
-                ),
-
-                const SizedBox(width: 20),
-
-                Expanded(
-            child: Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 26,
-                vertical: 22,
-              ),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1F1F1F),
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(
-                  color: getStatusColor(),
-                  width: 2,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: getStatusColor().withValues(alpha: 0.18),
-                    blurRadius: 18,
-                    spreadRadius: 1,
-                  ),
-                ],
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    width: 92,
-                    height: 92,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      color: getStatusColor().withValues(alpha: 0.12),
-                      border: Border.all(
-                        color: getStatusColor().withValues(alpha: 0.45),
-                        width: 2,
-                      ),
-                    ),
-                    child: Icon(
-                      getStatusIcon(),
-                      color: getStatusColor(),
-                      size: 54,
-                    ),
-                  ),
-
-                  const SizedBox(width: 24),
-                  Expanded(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      crossAxisAlignment:
-                          CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          'STATUT DU RIDE',
-                          style: TextStyle(
-                            color: Colors.white.withValues(
-                              alpha: 0.65,
-                            ),
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                            letterSpacing: 1.2,
-                          ),
-                        ),
-
-                        const SizedBox(height: 6),
-
-                        Text(
-                          getStatusLabel(),
-                          style: TextStyle(
-                            color: getStatusColor(),
-                            fontSize: 36,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-
-                        const SizedBox(height: 14),
-
-                        Container(
-                          height: 1,
-                          color: Colors.white.withValues(
-                            alpha: 0.08,
-                          ),
-                        ),
-
-                        const SizedBox(height: 14),
-
-                        Row(
-                          children: [
-                            Container(
-                              width: 10,
-                              height: 10,
-                              decoration: BoxDecoration(
-                                color: getStatusColor(),
-                                shape: BoxShape.circle,
-                              ),
-                            ),
-
-                            const SizedBox(width: 10),
-
-                            Expanded(
-                              child: Text(
-                                rideStatus == 'in_progress'
-                                    ? 'Le ride est actuellement en cours'
-                                    : rideStatus == 'paused'
-                                        ? 'Le ride est actuellement en pause'
-                                        : rideStatus == 'finished'
-                                            ? 'Le ride est terminé'
-                                            : 'Statut indisponible',
-                                style: TextStyle(
-                                  color: Colors.white.withValues(
-                                    alpha: 0.78,
-                                  ),
-                                  fontSize: 15,
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
                 ],
               ),
             ),
-          ),
-
-              ],
+            _buildBottomPanel(),
+            const SizedBox(height: 8),
+            Text(
+              appVersion,
+              style: const TextStyle(
+                fontSize: 12,
+                color: Colors.white38,
+              ),
             ),
-          ),
-
-          const SizedBox(height: 8),
-
-          Text(
-            appVersion,
-            style: const TextStyle(
-              fontSize: 12,
-              color: Colors.white38,
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
