@@ -3,8 +3,9 @@
 ## Déploiment
 flutter clean
 flutter pub get
+flutter build web
 flutter build web --release
-firebase deploy 
+firebase deploy
 
 flutter run -d chrome
 
