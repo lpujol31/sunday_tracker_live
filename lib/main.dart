@@ -5,14 +5,13 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'dart:html' as html;
 import 'core/router/app_router.dart';
-import 'core/theme/admin_theme.dart';
 import 'core/auth/auth_service.dart';
 
 const _supabaseUrl = 'https://eltlnrxiuvixjlakjfhz.supabase.co';
 const _supabaseAnonKey =
     'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVsdGxucnhpdXZpeGpsYWtqZmh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkyMDIxMTIsImV4cCI6MjA5NDc3ODExMn0.Udyy_6xF09JArDODJNkF-b-idlw4P-52ByzHilOOwwQ';
 
-const _firebaseOptions = FirebaseOptions(
+const firebaseOptions = FirebaseOptions(
   apiKey: 'AIzaSyCKzrKUwqKvuBowx_yQd4uT7_yc_JUISLg',
   authDomain: 'sunday-tracker-live.firebaseapp.com',
   projectId: 'sunday-tracker-live',
@@ -23,29 +22,29 @@ const _firebaseOptions = FirebaseOptions(
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // URLs sans # dans le navigateur
   usePathUrlStrategy();
 
+  // Supabase — toujours initialisé (page live + admin)
   await Supabase.initialize(url: _supabaseUrl, anonKey: _supabaseAnonKey);
-  await Firebase.initializeApp(options: _firebaseOptions);
 
-  final currentUrl = Uri.base.toString();
-  final isMagicLink = FirebaseAuth.instance.isSignInWithEmailLink(currentUrl);
-  final storedEmail = html.window.localStorage['adminPendingEmail'] ?? '(vide)';
+  // Firebase — uniquement sur les routes /admin
+  // Sur la page live (/ ou /?code=...) Firebase ne démarre pas
+  final path = Uri.base.path;
+  final isAdminRoute = path == '/admin' || path.startsWith('/admin/');
 
-  // Logs visibles dans le terminal Flutter
-  debugPrint('=== MAGIC LINK DEBUG ===');
-  debugPrint('URL: $currentUrl');
-  debugPrint('isMagicLink: $isMagicLink');
-  debugPrint('storedEmail: $storedEmail');
+  if (isAdminRoute) {
+    await Firebase.initializeApp(options: firebaseOptions);
 
-  if (isMagicLink) {
-    debugPrint('→ Tentative de connexion...');
-    try {
-      final success = await AuthService.handleMagicLinkIfPresent(currentUrl);
-      debugPrint('→ handleMagicLinkIfPresent: $success');
-      debugPrint('→ currentUser après: ${FirebaseAuth.instance.currentUser?.email}');
-    } catch (e) {
-      debugPrint('→ ERREUR: $e');
+    // Intercepte le Magic Link au retour depuis l'email
+    final currentUrl = Uri.base.toString();
+    if (FirebaseAuth.instance.isSignInWithEmailLink(currentUrl)) {
+      try {
+        await AuthService.handleMagicLinkIfPresent(currentUrl);
+      } catch (e) {
+        debugPrint('Erreur Magic Link: $e');
+      }
     }
   }
 
@@ -60,7 +59,6 @@ class SundayTrackerApp extends StatelessWidget {
     return MaterialApp.router(
       title: 'Sunday Tracker',
       debugShowCheckedModeBanner: false,
-      theme: buildAdminTheme(),
       routerConfig: appRouter,
     );
   }

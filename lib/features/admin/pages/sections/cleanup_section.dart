@@ -1,7 +1,7 @@
 // lib/features/admin/pages/sections/cleanup_section.dart
 import 'dart:html' as html;
 import 'package:flutter/material.dart';
-import 'package:intl/intl.dart';
+import 'package:intl/intl.dart'; // DateFormat utilisé dans _exportCsv et _fmtDate
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../../../core/theme/admin_theme.dart';
 
@@ -15,8 +15,10 @@ class _CleanupSectionState extends State<CleanupSection> {
   // ── Filtres ────────────────────────────────────────────────────────────────
   String _selectedTable = 'safety_positions';
   String _selectedStatus = 'Tous les statuts';
-  DateTime _dateFrom = DateTime.now().subtract(const Duration(days: 30));
-  DateTime _dateTo = DateTime.now();
+
+  // Seuils configurables (remplacent les constantes en dur)
+  int _thresholdInProgressHours = 48;
+  int _thresholdPausedDays = 7;
 
   // ── État ───────────────────────────────────────────────────────────────────
   bool _analyzed = false;
@@ -39,8 +41,8 @@ class _CleanupSectionState extends State<CleanupSection> {
 
     try {
       final supabase = Supabase.instance.client;
-      final cutoff48h = DateTime.now().subtract(const Duration(hours: 48));
-      final cutoff7d  = DateTime.now().subtract(const Duration(days: 7));
+      final cutoff48h = DateTime.now().subtract(Duration(hours: _thresholdInProgressHours));
+      final cutoff7d  = DateTime.now().subtract(Duration(days: _thresholdPausedDays));
 
       // 1. Positions orphelines
       final allPositionSessionIds = await supabase
@@ -132,8 +134,8 @@ class _CleanupSectionState extends State<CleanupSection> {
     setState(() { _purging = true; _error = null; });
     try {
       final supabase = Supabase.instance.client;
-      final cutoff48h = DateTime.now().subtract(const Duration(hours: 48));
-      final cutoff7d  = DateTime.now().subtract(const Duration(days: 7));
+      final cutoff48h = DateTime.now().subtract(Duration(hours: _thresholdInProgressHours));
+      final cutoff7d  = DateTime.now().subtract(Duration(days: _thresholdPausedDays));
 
       // Récupère les IDs des sessions fantômes à supprimer
       final ghostIds = _ghostDetails.map((s) => s['id'] as String).toList();
@@ -188,26 +190,6 @@ class _CleanupSectionState extends State<CleanupSection> {
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────
-  Future<void> _pickDate(bool isFrom) async {
-    final picked = await showDatePicker(
-      context: context,
-      initialDate: isFrom ? _dateFrom : _dateTo,
-      firstDate: DateTime(2024),
-      lastDate: DateTime.now().add(const Duration(days: 1)),
-      builder: (ctx, child) => Theme(
-        data: ThemeData.dark().copyWith(
-          colorScheme: const ColorScheme.dark(primary: AdminColors.accent, surface: AdminColors.surface),
-        ),
-        child: child!,
-      ),
-    );
-    if (picked == null) return;
-    setState(() { if (isFrom) _dateFrom = picked; else _dateTo = picked; });
-  }
-
-  String _fmt(DateTime d) =>
-      '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
-
   String _fmtDate(String? iso) {
     if (iso == null) return '—';
     final dt = DateTime.tryParse(iso)?.toLocal();
@@ -283,13 +265,11 @@ class _CleanupSectionState extends State<CleanupSection> {
             onChanged: (v) => setState(() => _selectedStatus = v)),
         const SizedBox(height: 10),
 
-        // Dates + Analyser
-        Row(children: [
-          Expanded(child: _DateButton(label: _fmt(_dateFrom), onTap: () => _pickDate(true))),
-          const SizedBox(width: 10),
-          Expanded(child: _DateButton(label: _fmt(_dateTo), onTap: () => _pickDate(false))),
-          const SizedBox(width: 10),
-          SizedBox(height: 44, child: ElevatedButton.icon(
+        // Bouton Analyser
+        SizedBox(
+          width: double.infinity,
+          height: 44,
+          child: ElevatedButton.icon(
             onPressed: _analyzing ? null : _analyze,
             style: ElevatedButton.styleFrom(
               backgroundColor: AdminColors.surface, foregroundColor: AdminColors.textPrimary,
@@ -301,8 +281,79 @@ class _CleanupSectionState extends State<CleanupSection> {
                     child: CircularProgressIndicator(strokeWidth: 2, color: AdminColors.accent))
                 : const Icon(Icons.refresh, size: 16),
             label: const Text('Analyser', style: TextStyle(fontSize: 13)),
-          )),
-        ]),
+          ),
+        ),
+        const SizedBox(height: 16),
+
+        // Seuils configurables
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: AdminColors.surface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: AdminColors.border),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Row(children: [
+              Icon(Icons.tune, color: AdminColors.textSecondary, size: 14),
+              SizedBox(width: 6),
+              Text('Seuils de détection des fantômes',
+                  style: TextStyle(color: AdminColors.textSecondary, fontSize: 12, fontWeight: FontWeight.w500)),
+            ]),
+            const SizedBox(height: 14),
+
+            // in_progress
+            Row(children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: AdminColors.dangerDim,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Text('in_progress',
+                    style: TextStyle(color: AdminColors.danger, fontSize: 11, fontWeight: FontWeight.w500)),
+              ),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text('considéré fantôme après',
+                    style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+              ),
+              _ThresholdStepper(
+                value: _thresholdInProgressHours,
+                unit: 'heures',
+                min: 1,
+                max: 720,
+                onChanged: (v) => setState(() => _thresholdInProgressHours = v),
+              ),
+            ]),
+            const SizedBox(height: 12),
+
+            // paused
+            Row(children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: AdminColors.warningDim,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: const Text('paused',
+                    style: TextStyle(color: AdminColors.warning, fontSize: 11, fontWeight: FontWeight.w500)),
+              ),
+              const SizedBox(width: 10),
+              const Expanded(
+                child: Text('considéré fantôme après',
+                    style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+              ),
+              _ThresholdStepper(
+                value: _thresholdPausedDays,
+                unit: 'jours',
+                min: 1,
+                max: 90,
+                onChanged: (v) => setState(() => _thresholdPausedDays = v),
+              ),
+            ]),
+          ]),
+        ),
 
         // Erreur
         if (_error != null) ...[
@@ -337,9 +388,9 @@ class _CleanupSectionState extends State<CleanupSection> {
             Expanded(child: _MetricCard(
               label: 'Sessions fantômes',
               value: '$_ghostSessions',
-              sub: 'in_progress > 48h ou paused > 7j',
+              sub: 'in_progress > ${_thresholdInProgressHours}h ou paused > ${_thresholdPausedDays}j',
               valueColor: AdminColors.warning,
-              tooltip: 'Sessions dans safety_sessions dont le statut\nest resté bloqué (ended_at IS NULL) :\n• in_progress depuis plus de 48h\n• paused depuis plus de 7 jours\nCe sont généralement des tests non terminés.',
+              tooltip: 'Sessions dans safety_sessions dont le statut\nest resté bloqué (ended_at IS NULL) :\n• in_progress depuis plus de ${_thresholdInProgressHours}h\n• paused depuis plus de ${_thresholdPausedDays} jours\nCe sont généralement des tests non terminés.',
             )),
             const SizedBox(width: 10),
             Expanded(child: _MetricCard(
@@ -550,25 +601,66 @@ class _Dropdown extends StatelessWidget {
   }
 }
 
-class _DateButton extends StatelessWidget {
-  final String label;
-  final VoidCallback onTap;
-  const _DateButton({required this.label, required this.onTap});
+class _ThresholdStepper extends StatelessWidget {
+  final int value;
+  final String unit;
+  final int min;
+  final int max;
+  final ValueChanged<int> onChanged;
+  const _ThresholdStepper({
+    required this.value, required this.unit,
+    required this.min, required this.max, required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      _StepBtn(
+        icon: Icons.remove,
+        onTap: value > min ? () => onChanged(value - 1) : null,
+      ),
+      Container(
+        width: 44,
+        height: 30,
+        alignment: Alignment.center,
+        decoration: const BoxDecoration(
+          border: Border.symmetric(
+            horizontal: BorderSide(color: AdminColors.border),
+          ),
+        ),
+        child: Text('$value',
+            style: const TextStyle(color: AdminColors.textPrimary, fontSize: 13)),
+      ),
+      _StepBtn(
+        icon: Icons.add,
+        onTap: value < max ? () => onChanged(value + 1) : null,
+      ),
+      const SizedBox(width: 6),
+      Text(unit, style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+    ]);
+  }
+}
+
+class _StepBtn extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback? onTap;
+  const _StepBtn({required this.icon, required this.onTap});
 
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
       child: Container(
-        height: 44,
-        padding: const EdgeInsets.symmetric(horizontal: 14),
-        decoration: BoxDecoration(color: AdminColors.surface,
-            borderRadius: BorderRadius.circular(8), border: Border.all(color: AdminColors.border)),
-        child: Row(children: [
-          const Icon(Icons.calendar_today_outlined, color: AdminColors.textSecondary, size: 14),
-          const SizedBox(width: 8),
-          Text(label, style: const TextStyle(color: AdminColors.textPrimary, fontSize: 13)),
-        ]),
+        width: 30,
+        height: 30,
+        decoration: BoxDecoration(
+          color: AdminColors.surface,
+          borderRadius: BorderRadius.circular(4),
+          border: Border.all(color: AdminColors.border),
+        ),
+        child: Icon(icon,
+            size: 14,
+            color: onTap != null ? AdminColors.textPrimary : AdminColors.textSecondary),
       ),
     );
   }

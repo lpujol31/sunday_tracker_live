@@ -1,12 +1,15 @@
-// lib/core/auth/auth_service.dart
 import 'package:firebase_auth/firebase_auth.dart';
-import 'dart:html' as html; // localStorage web
+import 'dart:html' as html;
 
 class AuthService {
   static final _auth = FirebaseAuth.instance;
 
-  static const String _adminEmail = 'lpujol31@icloud.com';
-  static const String _emailStorageKey = 'adminPendingEmail';
+  static const List<String> _authorizedEmails = [
+    'lpujol31@icloud.com',
+    'lpujol.novadys@gmail.com',
+  ];
+
+  static const _emailKey = 'adminPendingEmail';
 
   static String get _returnUrl {
     final host = Uri.base.host;
@@ -22,42 +25,46 @@ class AuthService {
   static bool get isAuthenticated => _auth.currentUser != null;
 
   static Future<void> sendMagicLink(String email) async {
-    if (email.trim().toLowerCase() != _adminEmail.toLowerCase()) {
+    final normalizedEmail = email.trim().toLowerCase();
+
+    if (!_authorizedEmails
+        .map((e) => e.toLowerCase())
+        .contains(normalizedEmail)) {
       throw Exception('Accès non autorisé.');
     }
 
-    final actionCodeSettings = ActionCodeSettings(
-      url: _returnUrl,
-      handleCodeInApp: true,
-      iOSBundleId: 'com.yourcompany.sundayTrackerLive',
-      androidPackageName: 'com.yourcompany.sunday_tracker_live',
-      androidInstallApp: false,
-    );
-
     await _auth.sendSignInLinkToEmail(
       email: email.trim(),
-      actionCodeSettings: actionCodeSettings,
+      actionCodeSettings: ActionCodeSettings(
+        url: _returnUrl,
+        handleCodeInApp: true,
+        iOSBundleId: 'com.yourcompany.sundayTrackerLive',
+        androidPackageName: 'com.yourcompany.sunday_tracker_live',
+        androidInstallApp: false,
+      ),
     );
 
-    // Stocke l'email dans localStorage — survit au rechargement de page
-    html.window.localStorage[_emailStorageKey] = email.trim();
+    html.window.localStorage[_emailKey] = email.trim();
   }
 
   static Future<bool> handleMagicLinkIfPresent(String link) async {
-    if (!_auth.isSignInWithEmailLink(link)) return false;
+  if (!_auth.isSignInWithEmailLink(link)) return false;
 
-    // Récupère l'email depuis localStorage
-    final email = html.window.localStorage[_emailStorageKey];
-    if (email == null || email.isEmpty) return false;
+  final email = html.window.localStorage[_emailKey];
+  if (email == null || email.isEmpty) return false;
 
-    await _auth.signInWithEmailLink(email: email, emailLink: link);
+  // Debug : vérifier le lien reçu
+  print('Magic link reçu : $link');
+  print('Email récupéré : $email');
 
-    // Nettoie le localStorage après connexion réussie
-    html.window.localStorage.remove(_emailStorageKey);
-    return true;
-  }
+  await _auth.signInWithEmailLink(
+    email: email,
+    emailLink: link,
+  );
 
-  static Future<void> signOut() async {
-    await _auth.signOut();
-  }
+  html.window.localStorage.remove(_emailKey);
+  return true;
+}
+
+  static Future<void> signOut() async => _auth.signOut();
 }
