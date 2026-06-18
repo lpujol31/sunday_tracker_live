@@ -84,10 +84,11 @@ class _LivePageState extends State<LivePage> {
   Timer? _tickerTimer;
   Duration _sinceLastUpdate = Duration.zero;
 
-  final MapController mapController = MapController();
+  MapController mapController = MapController();
   int _mapStyleIndex = 0;
   bool _mapFitDone = false;
-  double _currentZoom = 15.0; // zoom suivi dans le state
+  double _savedZoom = 15.0;
+  LatLng? _savedCenter;
 
   Timer? refreshTimer;
   int refreshIntervalSeconds = 30;
@@ -258,17 +259,11 @@ class _LivePageState extends State<LivePage> {
     if (points.isEmpty) return;
     final bounds = LatLngBounds.fromPoints(points);
     mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)));
-    // Zoom mis à jour après le frame suivant (fitCamera est asynchrone)
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _currentZoom = mapController.camera.zoom;
-    });
   }
 
   void _recenter() {
     if (latitude == null || longitude == null) return;
-    const zoom = 15.0;
-    mapController.move(LatLng(latitude!, longitude!), zoom);
-    _currentZoom = zoom;
+    mapController.move(LatLng(latitude!, longitude!), 15);
   }
 
   /// Met à jour le titre de l'onglet selon le statut du ride.
@@ -531,13 +526,19 @@ class _LivePageState extends State<LivePage> {
           final isActive = i == _mapStyleIndex;
           return GestureDetector(
             onTap: () {
+                if (i == _mapStyleIndex) return;
                 final newMaxZoom = (kMapStyles[i]['maxZoom'] as int).toDouble();
-                final clampedZoom = _currentZoom > newMaxZoom ? newMaxZoom : _currentZoom;
+                // Sauvegarder position courante avant de recréer la carte
+                final currentZoom = mapController.camera.zoom;
+                final currentCenter = mapController.camera.center;
                 setState(() {
                   _mapStyleIndex = i;
-                  _currentZoom = clampedZoom;
+                  // Clamper le zoom au maxZoom du nouveau style
+                  _savedZoom = currentZoom > newMaxZoom ? newMaxZoom : currentZoom;
+                  _savedCenter = currentCenter;
+                  // Nouveau controller = nouveau FlutterMap via la key
+                  mapController = MapController();
                 });
-                mapController.move(mapController.camera.center, clampedZoom);
               },
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
@@ -562,17 +563,14 @@ class _LivePageState extends State<LivePage> {
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: FlutterMap(
+        key: ValueKey('map_$_mapStyleIndex'),
         mapController: mapController,
         options: MapOptions(
-          initialCenter: currentPosition,
-          initialZoom: _currentZoom,
-          onPositionChanged: (position, hasGesture) {
-            // Toujours à jour, quelle que soit la source du changement
-            if (position.zoom != null) _currentZoom = position.zoom!;
-          },
+          initialCenter: _savedCenter ?? currentPosition,
+          initialZoom: _savedZoom,
         ),
         children: [
-          TileLayer(key: ValueKey(_mapStyleIndex), urlTemplate: kMapStyles[_mapStyleIndex]['url'] as String, subdomains: kMapStyles[_mapStyleIndex]['subdomains'] as List<String>, maxZoom: (kMapStyles[_mapStyleIndex]['maxZoom'] as int).toDouble(), userAgentPackageName: 'com.example.sunday_tracker_live'),
+          TileLayer(urlTemplate: kMapStyles[_mapStyleIndex]['url'] as String, subdomains: kMapStyles[_mapStyleIndex]['subdomains'] as List<String>, maxZoom: (kMapStyles[_mapStyleIndex]['maxZoom'] as int).toDouble(), userAgentPackageName: 'com.example.sunday_tracker_live'),
           if (points.length >= 2)
             PolylineLayer(polylines: List.generate(points.length - 1, (i) => Polyline(points: [points[i], points[i + 1]], strokeWidth: 5, color: gradientColors[i]))),
           MarkerLayer(markers: [
@@ -818,7 +816,7 @@ class _LivePageState extends State<LivePage> {
       backgroundColor: const Color(0xFF0D0D0D),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0D0D0D),
-        title: const Text('Sunday Tracker Live', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600)),
+        title: const Text('Sunday Tracker Live', style: TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.w600)),
         actions: _buildAppBarActions(context),
       ),
       body: SafeArea(
