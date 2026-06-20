@@ -33,6 +33,7 @@ class AuthService {
       throw Exception('Accès non autorisé.');
     }
 
+print('📧 Envoi magic link à : $email');
     await _auth.sendSignInLinkToEmail(
       email: email.trim(),
       actionCodeSettings: ActionCodeSettings(
@@ -43,6 +44,7 @@ class AuthService {
         androidInstallApp: false,
       ),
     );
+print('✅ Firebase a accepté la demande d\'envoi');
 
     html.window.localStorage[_emailKey] = email.trim();
   }

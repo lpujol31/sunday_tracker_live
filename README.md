@@ -1,5 +1,10 @@
 # sunday_tracker_live
 
+L'application Web affiche en temps réel sur une carte (OpenStreetMap/satellite & topo) la dernière position connue
+et tracé GPS d'un pratiquant outdoor participants à une pratique en outdoor (vtt, cyclo, trail, enduro, promenade...) événement ou une ballade dominicale (outdoor) sportif dominical, alimentée par Supabase comme backend live. 
+
+Ce tracé est partagé au départ par le participant 
+
 ## Déploiment
 flutter clean
 flutter pub get

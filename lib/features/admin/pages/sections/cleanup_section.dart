@@ -110,9 +110,9 @@ class _CleanupSectionState extends State<CleanupSection> {
             if (orphanCount > 0)
               _PreviewRow('safety_positions sans session (session_id introuvable)', orphanCount),
             if (ghostInProgressList.isNotEmpty)
-              _PreviewRow('safety_sessions statut in_progress > 48h', ghostInProgressList.length),
+              _PreviewRow('safety_sessions statut in_progress > ${_thresholdInProgressHours}h', ghostInProgressList.length),
             if (ghostPausedList.isNotEmpty)
-              _PreviewRow('safety_sessions statut paused > 7 jours', ghostPausedList.length),
+              _PreviewRow('safety_sessions statut paused > $_thresholdPausedDays jours', ghostPausedList.length),
           ]);
         _analyzed = true;
       });
@@ -303,53 +303,73 @@ class _CleanupSectionState extends State<CleanupSection> {
             const SizedBox(height: 14),
 
             // in_progress
-            Row(children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: AdminColors.dangerDim,
-                  borderRadius: BorderRadius.circular(4),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: AdminColors.dangerDim,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text('in_progress',
+                      style: TextStyle(color: AdminColors.danger, fontSize: 11, fontWeight: FontWeight.w500)),
                 ),
-                child: const Text('in_progress',
-                    style: TextStyle(color: AdminColors.danger, fontSize: 11, fontWeight: FontWeight.w500)),
-              ),
-              const SizedBox(width: 10),
-              const Expanded(
-                child: Text('considéré fantôme après',
-                    style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
-              ),
-              _ThresholdStepper(
-                value: _thresholdInProgressHours,
-                unit: 'heures',
-                min: 1,
-                max: 720,
-                onChanged: (v) => setState(() => _thresholdInProgressHours = v),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text('considéré fantôme après',
+                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+                ),
+                _ThresholdInputField(
+                  value: _thresholdInProgressHours,
+                  units: const ['heures', 'jours'],
+                  max: 720,
+                  onChanged: (v) => setState(() => _thresholdInProgressHours = v),
+                ),
+              ]),
+              const Padding(
+                padding: EdgeInsets.only(top: 5, left: 2),
+                child: Row(children: [
+                  Icon(Icons.info_outline, size: 11, color: AdminColors.textSecondary),
+                  SizedBox(width: 4),
+                  Text('Valeur personnalisable',
+                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 11)),
+                ]),
               ),
             ]),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
 
             // paused
-            Row(children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: AdminColors.warningDim,
-                  borderRadius: BorderRadius.circular(4),
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(
+                    color: AdminColors.warningDim,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text('paused',
+                      style: TextStyle(color: AdminColors.warning, fontSize: 11, fontWeight: FontWeight.w500)),
                 ),
-                child: const Text('paused',
-                    style: TextStyle(color: AdminColors.warning, fontSize: 11, fontWeight: FontWeight.w500)),
-              ),
-              const SizedBox(width: 10),
-              const Expanded(
-                child: Text('considéré fantôme après',
-                    style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
-              ),
-              _ThresholdStepper(
-                value: _thresholdPausedDays,
-                unit: 'jours',
-                min: 1,
-                max: 90,
-                onChanged: (v) => setState(() => _thresholdPausedDays = v),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text('considéré fantôme après',
+                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+                ),
+                _ThresholdInputField(
+                  value: _thresholdPausedDays,
+                  units: const ['jours', 'semaines'],
+                  max: 90,
+                  onChanged: (v) => setState(() => _thresholdPausedDays = v),
+                ),
+              ]),
+              const Padding(
+                padding: EdgeInsets.only(top: 5, left: 2),
+                child: Row(children: [
+                  Icon(Icons.info_outline, size: 11, color: AdminColors.textSecondary),
+                  SizedBox(width: 4),
+                  Text('Valeur personnalisable',
+                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 11)),
+                ]),
               ),
             ]),
           ]),
@@ -601,68 +621,125 @@ class _Dropdown extends StatelessWidget {
   }
 }
 
-class _ThresholdStepper extends StatelessWidget {
-  final int value;
-  final String unit;
-  final int min;
-  final int max;
-  final ValueChanged<int> onChanged;
-  const _ThresholdStepper({
-    required this.value, required this.unit,
-    required this.min, required this.max, required this.onChanged,
+class _ThresholdInputField extends StatefulWidget {
+  final int value; // always in base unit (units[0])
+  final List<String> units;
+  final int max; // in base unit
+  final ValueChanged<int> onChanged; // always in base unit
+
+  const _ThresholdInputField({
+    required this.value,
+    required this.units,
+    required this.max,
+    required this.onChanged,
   });
+
+  @override
+  State<_ThresholdInputField> createState() => _ThresholdInputFieldState();
+}
+
+class _ThresholdInputFieldState extends State<_ThresholdInputField> {
+  late String _selectedUnit;
+  late TextEditingController _ctrl;
+
+  // Conversion factor: base unit → selected unit
+  int get _factor {
+    final base = widget.units.first;
+    if (base == 'heures' && _selectedUnit == 'jours') return 24;
+    if (base == 'jours' && _selectedUnit == 'semaines') return 7;
+    return 1;
+  }
+
+  int get _displayValue => widget.value ~/ _factor;
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedUnit = widget.units.first;
+    _ctrl = TextEditingController(text: '${widget.value}');
+  }
+
+  @override
+  void didUpdateWidget(_ThresholdInputField old) {
+    super.didUpdateWidget(old);
+    if (old.value != widget.value) {
+      final shown = int.tryParse(_ctrl.text) ?? 0;
+      if (shown != _displayValue) _ctrl.text = '$_displayValue';
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _onTextChanged(String text) {
+    final v = int.tryParse(text);
+    if (v == null || v < 1) return;
+    final base = v * _factor;
+    if (base <= widget.max) widget.onChanged(base);
+  }
+
+  void _onUnitChanged(String? unit) {
+    if (unit == null || unit == _selectedUnit) return;
+    setState(() {
+      _selectedUnit = unit;
+      _ctrl.text = '$_displayValue';
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return Row(mainAxisSize: MainAxisSize.min, children: [
-      _StepBtn(
-        icon: Icons.remove,
-        onTap: value > min ? () => onChanged(value - 1) : null,
-      ),
-      Container(
-        width: 44,
-        height: 30,
-        alignment: Alignment.center,
-        decoration: const BoxDecoration(
-          border: Border.symmetric(
-            horizontal: BorderSide(color: AdminColors.border),
+      SizedBox(
+        width: 72,
+        height: 36,
+        child: TextField(
+          controller: _ctrl,
+          keyboardType: TextInputType.number,
+          textAlign: TextAlign.center,
+          style: const TextStyle(color: AdminColors.textPrimary, fontSize: 14),
+          decoration: InputDecoration(
+            contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 0),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AdminColors.border),
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(8),
+              borderSide: const BorderSide(color: AdminColors.accent),
+            ),
+            filled: true,
+            fillColor: AdminColors.surface,
           ),
+          onChanged: _onTextChanged,
         ),
-        child: Text('$value',
-            style: const TextStyle(color: AdminColors.textPrimary, fontSize: 13)),
       ),
-      _StepBtn(
-        icon: Icons.add,
-        onTap: value < max ? () => onChanged(value + 1) : null,
-      ),
-      const SizedBox(width: 6),
-      Text(unit, style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
-    ]);
-  }
-}
-
-class _StepBtn extends StatelessWidget {
-  final IconData icon;
-  final VoidCallback? onTap;
-  const _StepBtn({required this.icon, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: 30,
-        height: 30,
+      const SizedBox(width: 8),
+      Container(
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         decoration: BoxDecoration(
           color: AdminColors.surface,
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(color: AdminColors.border),
         ),
-        child: Icon(icon,
-            size: 14,
-            color: onTap != null ? AdminColors.textPrimary : AdminColors.textSecondary),
+        alignment: Alignment.center,
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<String>(
+            value: _selectedUnit,
+            dropdownColor: AdminColors.surface,
+            iconEnabledColor: AdminColors.textSecondary,
+            iconSize: 16,
+            style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13),
+            items: widget.units.map((u) =>
+                DropdownMenuItem(value: u, child: Text(u))).toList(),
+            onChanged: _onUnitChanged,
+          ),
+        ),
       ),
-    );
+    ]);
   }
 }
 
