@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 // ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html show document, LinkElement;
+import 'dart:html' as html show document;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -87,6 +87,8 @@ class _LivePageState extends State<LivePage> {
   MapController mapController = MapController();
   int _mapStyleIndex = 0;
   bool _mapFitDone = false;
+  bool _mapReady = false;
+
   double _savedZoom = 15.0;
   LatLng? _savedCenter;
 
@@ -102,11 +104,7 @@ class _LivePageState extends State<LivePage> {
     loadLastPosition();
     startAutoRefresh();
     _tickerTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (lastUpdate != null) {
-        setState(() {
-          _sinceLastUpdate = DateTime.now().difference(lastUpdate!);
-        });
-      }
+      if (lastUpdate != null) setState(() { _sinceLastUpdate = DateTime.now().difference(lastUpdate!); });
     });
   }
 
@@ -115,6 +113,15 @@ class _LivePageState extends State<LivePage> {
     refreshTimer?.cancel();
     _tickerTimer?.cancel();
     super.dispose();
+  }
+
+  String _formatSinceLastUpdate() {
+    final s = _sinceLastUpdate.inSeconds;
+    if (s < 60) return 'il y a $s s';
+    final m = _sinceLastUpdate.inMinutes;
+    if (m < 60) return 'il y a $m min';
+    final h = _sinceLastUpdate.inHours;
+    return 'il y a ${h}h${(m - h * 60).toString().padLeft(2, '0')}';
   }
 
   bool get _isFinished => rideStatus == 'finished';
@@ -139,8 +146,6 @@ class _LivePageState extends State<LivePage> {
     if (_isFinished) {
       refreshTimer?.cancel();
       refreshTimer = null;
-      _tickerTimer?.cancel();
-      _tickerTimer = null;
     }
   }
 
@@ -181,6 +186,81 @@ class _LivePageState extends State<LivePage> {
       case 'finished': return 'Terminé';
       default: return 'Inconnu';
     }
+  }
+
+  Color _getSignalColor() {
+    if (_isFinished || lastUpdate == null) return const Color(0xFF4ADE80);
+    final s = _sinceLastUpdate.inSeconds;
+    if (s < 120) return const Color(0xFF4ADE80);
+    if (s < 300) return const Color(0xFFFACC15);
+    return const Color(0xFFF87171);
+  }
+
+  String _getSignalLabel() {
+    if (_isFinished || lastUpdate == null) return 'Signal reçu';
+    final s = _sinceLastUpdate.inSeconds;
+    if (s < 120) return 'Signal reçu';
+    if (s < 300) return 'Signal faible';
+    return 'Signal perdu';
+  }
+
+  Widget _buildSignalIndicator() {
+    final color = _getSignalColor();
+    return Tooltip(
+      message: '< 2 min : Signal reçu\n2–5 min : Signal faible\n> 5 min : Signal perdu',
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(width: 7, height: 7, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
+          const SizedBox(width: 5),
+          Text(_getSignalLabel(), style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w600)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildVersionBadge() {
+    final parts = appVersion.split('+');
+    final version = parts.first;
+    final build = parts.length > 1 ? parts[1].split(' ').first : '';
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 3,
+            height: 36,
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [Color(0xFFFF8A00), Color(0xFF6D28D9)],
+              ),
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(8),
+                bottomLeft: Radius.circular(8),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(8, 6, 10, 6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(version, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                if (build.isNotEmpty)
+                  Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 10)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   List<LatLng> get tracePoints {
@@ -232,23 +312,6 @@ class _LivePageState extends State<LivePage> {
     return '$h:$m:$s';
   }
 
-  String _formatSinceLastUpdate() {
-    // Si le ride est terminé, afficher l'heure de fin plutôt qu'un délai alarme
-    if (_isFinished && lastUpdate != null) {
-      final dt = lastUpdate!.toLocal();
-      final hh = dt.hour.toString().padLeft(2, '0');
-      final mm = dt.minute.toString().padLeft(2, '0');
-      return 'à $hh:$mm';
-    }
-    final s = _sinceLastUpdate.inSeconds;
-    if (s < 60) return 'il y a ${s}s';
-    final m = _sinceLastUpdate.inMinutes;
-    if (m < 60) return 'il y a ${m} min';
-    final h = _sinceLastUpdate.inHours;
-    final rem = m - h * 60;
-    return 'il y a ${h}h${rem.toString().padLeft(2, '0')}';
-  }
-
   String _formatStartTime() {
     if (rideStartTime == null) return '--:--';
     final dt = rideStartTime!.toLocal();
@@ -259,6 +322,14 @@ class _LivePageState extends State<LivePage> {
     if (points.isEmpty) return;
     final bounds = LatLngBounds.fromPoints(points);
     mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)));
+  }
+
+  void _tryInitialFit() {
+    if (!_mapReady || _mapFitDone) return;
+    final points = tracePoints;
+    if (points.isEmpty) return;
+    _fitBounds(points);
+    _mapFitDone = true;
   }
 
   void _recenter() {
@@ -337,10 +408,12 @@ class _LivePageState extends State<LivePage> {
       });
       _stopPollingIfFinished();
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        final points = tracePoints;
-        if (points.isEmpty) return;
-        if (!_mapFitDone) { _fitBounds(points); _mapFitDone = true; }
-        else { mapController.move(LatLng(latitude!, longitude!), mapController.camera.zoom); }
+        if (!mounted) return;
+        if (!_mapFitDone) {
+          _tryInitialFit();
+        } else {
+          mapController.move(LatLng(latitude!, longitude!), mapController.camera.zoom);
+        }
       });
       if (manual) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Position mise à jour'), behavior: SnackBarBehavior.floating, duration: Duration(seconds: 2)));
@@ -348,63 +421,6 @@ class _LivePageState extends State<LivePage> {
     } catch (e) {
       setState(() { errorMessage = 'system_error'; errorDetails = e.toString(); isLoading = false; isRefreshing = false; });
     }
-  }
-
-  List<Widget> _buildAppBarActions(BuildContext context) {
-    final isMobile = MediaQuery.of(context).size.width < 700;
-
-    // Sur mobile + ride terminé → rien à afficher dans la barre
-    if (_isFinished && isMobile) return [];
-
-    if (isMobile) {
-      // Mobile : icône unique qui ouvre un bottom sheet
-      return [
-        if (isRefreshing)
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 8),
-            child: Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange))),
-          ),
-        IconButton(
-          icon: const Icon(Icons.more_vert, color: Colors.orange),
-          tooltip: 'Options',
-          onPressed: () => _showRefreshBottomSheet(context),
-        ),
-      ];
-    }
-
-    // Desktop : affichage complet
-    return [
-      if (isRefreshing)
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 8),
-          child: Center(child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange))),
-        ),
-      if (!_isFinished) ...[
-        IconButton(
-          icon: const Icon(Icons.refresh, color: Colors.orange),
-          tooltip: 'Rafraîchir maintenant',
-          onPressed: isRefreshing ? null : () => loadLastPosition(manual: true),
-        ),
-        Row(children: [
-          const Text('Auto', style: TextStyle(color: Colors.white70, fontSize: 14)),
-          const SizedBox(width: 8),
-          DropdownButtonHideUnderline(child: DropdownButton<int>(
-            value: refreshIntervalSeconds,
-            dropdownColor: const Color(0xFF1B1B1B),
-            iconEnabledColor: Colors.orange,
-            style: const TextStyle(color: Colors.white),
-            items: const [
-              DropdownMenuItem(value: 0, child: Text('Off')),
-              DropdownMenuItem(value: 15, child: Text('15 s')),
-              DropdownMenuItem(value: 30, child: Text('30 s')),
-              DropdownMenuItem(value: 60, child: Text('60 s')),
-            ],
-            onChanged: (value) { if (value == null) return; changeRefreshInterval(value); },
-          )),
-          const SizedBox(width: 12),
-        ]),
-      ],
-    ];
   }
 
   void _showRefreshBottomSheet(BuildContext context) {
@@ -533,11 +549,10 @@ class _LivePageState extends State<LivePage> {
                 final currentCenter = mapController.camera.center;
                 setState(() {
                   _mapStyleIndex = i;
-                  // Clamper le zoom au maxZoom du nouveau style
                   _savedZoom = currentZoom > newMaxZoom ? newMaxZoom : currentZoom;
                   _savedCenter = currentCenter;
-                  // Nouveau controller = nouveau FlutterMap via la key
                   mapController = MapController();
+                  _mapReady = false;
                 });
               },
             child: AnimatedContainer(
@@ -560,14 +575,18 @@ class _LivePageState extends State<LivePage> {
     final points = tracePoints;
     final currentPosition = LatLng(latitude!, longitude!);
     final gradientColors = _buildGradientColors(points.length);
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: FlutterMap(
+    return FlutterMap(
         key: ValueKey('map_$_mapStyleIndex'),
         mapController: mapController,
         options: MapOptions(
           initialCenter: _savedCenter ?? currentPosition,
           initialZoom: _savedZoom,
+          onMapReady: () {
+            _mapReady = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) _tryInitialFit();
+            });
+          },
         ),
         children: [
           TileLayer(urlTemplate: kMapStyles[_mapStyleIndex]['url'] as String, subdomains: kMapStyles[_mapStyleIndex]['subdomains'] as List<String>, maxZoom: (kMapStyles[_mapStyleIndex]['maxZoom'] as int).toDouble(), userAgentPackageName: 'com.example.sunday_tracker_live'),
@@ -581,159 +600,426 @@ class _LivePageState extends State<LivePage> {
             Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
           ]),
         ],
-      ),
     );
   }
 
-  Widget _buildStatsCard() {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 700;
-    final staleMins = _sinceLastUpdate.inMinutes;
-    final staleColor = _isFinished
-        ? Colors.white54
-        : staleMins >= 10
-            ? const Color(0xFFF87171)
-            : staleMins >= 5
-                ? const Color(0xFFFACC15)
-                : const Color(0xFFFF8A00);
+  Widget _buildTopOverlay(bool isMobile, double topPadding) {
     return Container(
-      padding: EdgeInsets.symmetric(horizontal: isMobile ? 16 : 24, vertical: isMobile ? 14 : 18),
-      decoration: BoxDecoration(color: const Color(0xFF1F1F1F), borderRadius: BorderRadius.circular(20)),
-      child: isMobile
-          ? Column(children: [
-              Row(children: [Expanded(child: _StatItem(icon: Icons.straighten, label: 'Distance', value: _formatDistance(_totalDistanceMeters), large: true)), Expanded(child: _StatItem(icon: Icons.timer_outlined, label: 'Durée', value: _formatDuration(_rideDuration), large: true))]),
-              const SizedBox(height: 12),
-              Row(children: [Expanded(child: _StatItem(icon: Icons.flag_outlined, label: 'Départ', value: _formatStartTime())), Expanded(child: _StatItem(icon: Icons.my_location, label: 'Dernière pos.', value: _formatSinceLastUpdate(), valueColor: staleColor))]),
-            ])
-          : Row(mainAxisAlignment: MainAxisAlignment.spaceAround, children: [
-              _StatItem(icon: Icons.straighten, label: 'Distance', value: _formatDistance(_totalDistanceMeters), large: true),
-              _divider(),
-              _StatItem(icon: Icons.timer_outlined, label: 'Durée', value: _formatDuration(_rideDuration), large: true),
-              _divider(),
-              _StatItem(icon: Icons.flag_outlined, label: 'Départ', value: _formatStartTime()),
-              _divider(),
-              _StatItem(icon: Icons.my_location, label: 'Dernière pos.', value: _formatSinceLastUpdate(), valueColor: staleColor),
-            ]),
-    );
-  }
-
-  Widget _divider() => Container(width: 1, height: 36, color: Colors.white12);
-
-  Widget _buildLocationCard() {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 700;
-    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      if (!isMobile) ...[
-        Container(width: 40, height: 40, decoration: BoxDecoration(borderRadius: BorderRadius.circular(12), gradient: LinearGradient(colors: [Colors.orange.withValues(alpha: 0.25), Colors.orange.withValues(alpha: 0.08)], begin: Alignment.topLeft, end: Alignment.bottomRight)), child: const Icon(Icons.location_on, color: Colors.orange, size: 22)),
-        const SizedBox(width: 10),
-      ],
-      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Container(width: 3, height: 32, decoration: BoxDecoration(color: Colors.orange, borderRadius: BorderRadius.circular(20))),
-          const SizedBox(width: 8),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Dernière position', style: TextStyle(color: Colors.white, fontSize: isMobile ? 12 : 13, fontWeight: FontWeight.bold)),
-            Text('${latitude?.toStringAsFixed(6)}, ${longitude?.toStringAsFixed(6)}', style: TextStyle(color: Colors.white54, fontSize: isMobile ? 11 : 11)),
-          ])),
-        ]),
-        const SizedBox(height: 16),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            SizedBox(
-              width: isMobile ? double.infinity : null,
-              child: ElevatedButton.icon(
-                onPressed: () => _showNavigationSheet(context),
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2B2035), foregroundColor: const Color(0xFFD7B8FF), padding: EdgeInsets.symmetric(horizontal: isMobile ? 14 : 18, vertical: 14), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
-                icon: const Icon(Icons.map),
-                label: Text(isMobile ? 'Ouvrir dans…' : 'Ouvrir dans…'),
-              ),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [Colors.black.withValues(alpha: 0.80), Colors.transparent],
+        ),
+      ),
+      padding: EdgeInsets.fromLTRB(16, topPadding + 12, 12, 28),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Sunday Tracker Live',
+                    style: TextStyle(color: Colors.white, fontSize: isMobile ? 14 : 28, fontWeight: FontWeight.bold, shadows: [Shadow(color: Colors.black54, blurRadius: 4)])),
+                const SizedBox(height: 6),
+                _buildVersionBadge(),
+              ],
             ),
-            SizedBox(
-              width: isMobile ? double.infinity : null,
-              child: ElevatedButton.icon(
-                onPressed: _copyShareLink,
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF1E2B1E), foregroundColor: const Color(0xFF86EFAC), padding: EdgeInsets.symmetric(horizontal: isMobile ? 14 : 18, vertical: 14), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30))),
-                icon: const Icon(Icons.link),
-                label: const Text('Copier le lien'),
+          ),
+          if (!isMobile && !_isFinished) ...[
+            if (isRefreshing)
+              const Padding(
+                padding: EdgeInsets.only(right: 8, top: 2),
+                child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)),
               ),
+            GestureDetector(
+              onTap: isRefreshing ? null : () => loadLastPosition(manual: true),
+              child: const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.refresh, color: Colors.orange, size: 22)),
+            ),
+            DropdownButtonHideUnderline(child: DropdownButton<int>(
+              value: refreshIntervalSeconds,
+              dropdownColor: const Color(0xFF1B1B1B),
+              iconEnabledColor: Colors.orange,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              items: const [
+                DropdownMenuItem(value: 0, child: Text('Off')),
+                DropdownMenuItem(value: 15, child: Text('15 s')),
+                DropdownMenuItem(value: 30, child: Text('30 s')),
+                DropdownMenuItem(value: 60, child: Text('60 s')),
+              ],
+              onChanged: (v) { if (v != null) changeRefreshInterval(v); },
+            )),
+            const SizedBox(width: 8),
+          ],
+          if (isMobile && !_isFinished) ...[
+            if (isRefreshing)
+              const Padding(
+                padding: EdgeInsets.only(right: 4, top: 4),
+                child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)),
+              ),
+            GestureDetector(
+              onTap: () => _showRefreshBottomSheet(context),
+              child: const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.more_vert, color: Colors.orange, size: 22)),
             ),
           ],
-        ),
-        const SizedBox(height: 14),
-        Row(children: [
-          const Icon(Icons.access_time, color: Colors.white54, size: 16),
-          const SizedBox(width: 8),
-          Expanded(child: Text(lastUpdate == null ? 'Dernière mise à jour inconnue' : 'Dernière mise à jour : ${DateFormat('dd/MM/yyyy HH:mm:ss').format(lastUpdate!.toLocal())}', style: const TextStyle(color: Colors.white70, fontSize: 12))),
-        ]),
-      ])),
-    ]);
-  }
-
-  Widget _buildStatusCard() {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 700;
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: isMobile ? 10 : 14, vertical: isMobile ? 10 : 12),
-      decoration: BoxDecoration(color: const Color(0xFF1F1F1F), borderRadius: BorderRadius.circular(20), border: Border.all(color: getStatusColor(), width: 1.5), boxShadow: [BoxShadow(color: getStatusColor().withValues(alpha: 0.15), blurRadius: 12, spreadRadius: 0)]),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-        Container(width: isMobile ? 36 : 48, height: isMobile ? 36 : 48, decoration: BoxDecoration(shape: BoxShape.circle, color: getStatusColor().withValues(alpha: 0.12), border: Border.all(color: getStatusColor().withValues(alpha: 0.4), width: 1.5)), child: Icon(getStatusIcon(), color: getStatusColor(), size: isMobile ? 20 : 26)),
-        SizedBox(width: isMobile ? 10 : 12),
-        Expanded(child: Column(mainAxisAlignment: MainAxisAlignment.center, crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text('STATUT', style: TextStyle(color: Colors.white.withValues(alpha: 0.45), fontSize: 10, fontWeight: FontWeight.w600, letterSpacing: 1.2)),
-          const SizedBox(height: 2),
-          Text(getStatusLabel(), style: TextStyle(color: getStatusColor(), fontSize: isMobile ? 16 : 20, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 6),
-          Container(height: 1, color: Colors.white.withValues(alpha: 0.07)),
-          const SizedBox(height: 6),
-          Row(children: [
-            Container(width: 6, height: 6, decoration: BoxDecoration(color: getStatusColor(), shape: BoxShape.circle)),
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(getStatusIcon(), color: getStatusColor(), size: isMobile ? 18 : 20),
             const SizedBox(width: 6),
-            Expanded(child: Text(rideStatus == 'in_progress' ? 'En cours' : rideStatus == 'paused' ? 'En pause' : rideStatus == 'finished' ? 'Terminé' : 'Inconnu', style: TextStyle(color: Colors.white.withValues(alpha: 0.55), fontSize: 11))),
+            Text(getStatusLabel(), style: TextStyle(color: getStatusColor(), fontSize: isMobile ? 18 : 20, fontWeight: FontWeight.bold)),
           ]),
-        ])),
-      ]),
+        ],
+      ),
     );
   }
 
-  Widget _buildBottomPanel() {
-    final screenWidth = MediaQuery.of(context).size.width;
-    final isMobile = screenWidth < 700;
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-        isMobile ? 14 : 20,
-        isMobile ? 14 : 20,
-        isMobile ? 14 : 20,
-        4,
+  String _formatUpdateDateFr() {
+    if (lastUpdate == null) return '';
+    final dt = lastUpdate!.toLocal();
+    const months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin',
+                    'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
+  }
+
+  String _formatStartDateFr() {
+    if (rideStartTime == null) return '--';
+    final dt = rideStartTime!.toLocal();
+    const months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin',
+                    'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
+  }
+
+  Widget _buildStatBlock(String label, String value) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+        const SizedBox(height: 2),
+        Text(value, style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 17, fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+
+  Widget _buildDepartBlock() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text('Départ', style: TextStyle(color: Colors.white54, fontSize: 11)),
+        const SizedBox(height: 2),
+        Text(_formatStartDateFr(), style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+        Text(_formatStartTime(), style: const TextStyle(color: Colors.white60, fontSize: 12)),
+      ],
+    );
+  }
+
+  Widget _buildPositionCard() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1B1B1B),
+        borderRadius: BorderRadius.circular(16),
       ),
-      child: LayoutBuilder(builder: (context, constraints) {
-        final isNarrow = constraints.maxWidth < 900;
-        if (isNarrow) {
-          return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            _buildStatsCard(),
-            const SizedBox(height: 12),
-            _buildLocationCard(),
-            const SizedBox(height: 12),
-            _buildStatusCard(),
-            const SizedBox(height: 8),
-            Center(child: Text(appVersion, style: const TextStyle(fontSize: 11, color: Colors.white38))),
-            const SizedBox(height: 8),
-          ]);
-        }
-        return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          _buildStatsCard(),
-          const SizedBox(height: 16),
-          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Expanded(flex: 2, child: _buildLocationCard()),
-            const SizedBox(width: 20),
-            Expanded(child: _buildStatusCard()),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(children: [
+            const Text('DERNIÈRE POSITION CONNUE',
+              style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
+            const Spacer(),
+            if (!_isFinished) _buildSignalIndicator(),
           ]),
-          const SizedBox(height: 8),
-          Center(child: Text(appVersion, style: const TextStyle(fontSize: 11, color: Colors.white38))),
-          const SizedBox(height: 8),
-        ]);
-      }),
+          const SizedBox(height: 6),
+          Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+            const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 20),
+            const SizedBox(width: 8),
+            Text(_formatSinceLastUpdate(),
+              style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
+          ]),
+          if (lastUpdate != null) ...[
+            const SizedBox(height: 8),
+            Row(children: [
+              const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
+              const SizedBox(width: 6),
+              Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
+              const SizedBox(width: 14),
+              const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
+              const SizedBox(width: 6),
+              Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
+                style: const TextStyle(color: Colors.white60, fontSize: 11)),
+            ]),
+          ],
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(
+              flex: 3,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _showNavigationSheet(context),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 9),
+                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
+                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.map_outlined, color: Colors.white, size: 15),
+                    SizedBox(width: 6),
+                    Text('Ouvrir la position',
+                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
+                  ]),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 2,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _copyShareLink,
+                child: Container(
+                  padding: const EdgeInsets.symmetric(vertical: 9),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF232323),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Icon(Icons.link, color: Colors.white38, size: 14),
+                    SizedBox(width: 5),
+                    Text('Copier le lien',
+                      style: TextStyle(color: Colors.white38, fontSize: 11)),
+                  ]),
+                ),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDesktopBottomBar(double bottomPadding) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(20, 0, 20, 14 + bottomPadding),
+      child: IntrinsicHeight(
+        child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1B1B1B),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: IntrinsicWidth(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      _buildMapStyleSelector(),
+                      const Spacer(),
+                      GestureDetector(
+                        onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
+                        child: Container(
+                          width: 36, height: 36,
+                          decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
+                          child: const Icon(Icons.fit_screen, color: Colors.white, size: 18),
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      GestureDetector(
+                        onTap: _recenter,
+                        child: Container(
+                          width: 36, height: 36,
+                          decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
+                          child: const Icon(Icons.my_location, color: Colors.white, size: 18),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  Container(height: 1, color: Colors.white24),
+                  const SizedBox(height: 10),
+                  IntrinsicHeight(
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters)),
+                        const SizedBox(width: 12),
+                        Container(width: 1, color: Colors.white12),
+                        const SizedBox(width: 12),
+                        _buildStatBlock('Durée', _formatDuration(_rideDuration)),
+                        const SizedBox(width: 12),
+                        Container(width: 1, color: Colors.white12),
+                        const SizedBox(width: 12),
+                        _buildDepartBlock(),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const Spacer(),
+          SizedBox(
+            width: 440,
+            child: _buildPositionCard(),
+          ),
+        ],
+      ),
+      ),
+    );
+  }
+
+  Widget _buildMobileBottomPanel(double bottomPadding) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(14, 0, 14, 12 + bottomPadding),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1B1B1B),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Controls row
+            Row(
+              children: [
+                _buildMapStyleSelector(),
+                const Spacer(),
+                if (!_isFinished) ...[
+                  GestureDetector(
+                    onTap: () => _showRefreshBottomSheet(context),
+                    child: Container(
+                      width: 36, height: 36,
+                      decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
+                      child: isRefreshing
+                          ? const Center(child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)))
+                          : const Icon(Icons.sync, color: Colors.white, size: 18),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                ],
+                GestureDetector(
+                  onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
+                  child: Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
+                    child: const Icon(Icons.fit_screen, color: Colors.white, size: 18),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                GestureDetector(
+                  onTap: _recenter,
+                  child: Container(
+                    width: 36, height: 36,
+                    decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
+                    child: const Icon(Icons.my_location, color: Colors.white, size: 18),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Container(height: 1, color: Colors.white24),
+            const SizedBox(height: 10),
+            // Stats row
+            Row(
+              children: [
+                Expanded(child: _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters))),
+                Container(width: 1, height: 36, color: Colors.white12),
+                Expanded(child: Padding(
+                  padding: const EdgeInsets.only(left: 14),
+                  child: _buildStatBlock('Durée', _formatDuration(_rideDuration)),
+                )),
+                Container(width: 1, height: 36, color: Colors.white12),
+                Expanded(child: Padding(
+                  padding: const EdgeInsets.only(left: 14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('Départ', style: TextStyle(color: Colors.white54, fontSize: 11)),
+                      const SizedBox(height: 2),
+                      Text(
+                        rideStartTime != null ? '${_formatStartDateFr()} • ${_formatStartTime()}' : '--',
+                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                )),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Container(height: 1, color: Colors.white12),
+            const SizedBox(height: 10),
+            // Position header
+            Row(children: [
+              const Text('DERNIÈRE POSITION CONNUE',
+                style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
+              const Spacer(),
+              if (!_isFinished) _buildSignalIndicator(),
+            ]),
+            const SizedBox(height: 8),
+            // Position + date/heure sur une ligne
+            Row(children: [
+              const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 18),
+              const SizedBox(width: 6),
+              Text(_formatSinceLastUpdate(),
+                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              if (lastUpdate != null) ...[
+                const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
+                const SizedBox(width: 5),
+                Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
+                const SizedBox(width: 10),
+                const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
+                const SizedBox(width: 5),
+                Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
+                  style: const TextStyle(color: Colors.white60, fontSize: 11)),
+              ],
+            ]),
+            const SizedBox(height: 12),
+            // Boutons
+            Row(children: [
+              Expanded(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: () => _showNavigationSheet(context),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
+                    child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                      Icon(Icons.map_outlined, color: Colors.white, size: 15),
+                      SizedBox(width: 6),
+                      Text('Ouvrir la position', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                    ]),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _copyShareLink,
+                child: Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF232323),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: Colors.white12),
+                  ),
+                  child: const Icon(Icons.link, color: Colors.white38, size: 18),
+                ),
+              ),
+            ]),
+          ],
+        ),
+      ),
     );
   }
 
@@ -812,91 +1098,28 @@ class _LivePageState extends State<LivePage> {
     if (errorMessage != null || latitude == null || longitude == null) {
       return Scaffold(backgroundColor: const Color(0xFF0D0D0D), body: SafeArea(child: _buildErrorScreen()));
     }
+    final screenSize = MediaQuery.sizeOf(context);
+    final isMobileLayout = screenSize.width < 900;
+    final topPadding = MediaQuery.of(context).padding.top;
+    final bottomPadding = MediaQuery.of(context).padding.bottom;
     return Scaffold(
-      backgroundColor: const Color(0xFF0D0D0D),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF0D0D0D),
-        title: const Text('Sunday Tracker Live', style: TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.w600)),
-        actions: _buildAppBarActions(context),
-      ),
-      body: SafeArea(
-        top: false,
-        child: Column(
-          children: [
-            // Carte — même maxWidth que le panneau bas
-            Expanded(
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1400),
-                  child: Stack(children: [
-                    _buildMap(),
-                    Positioned(bottom: 16, left: 16, child: _buildMapStyleSelector()),
-                    Positioned(
-                      bottom: 16,
-                      right: 16,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          GestureDetector(
-                            onTap: () {
-                              final pts = tracePoints;
-                              if (pts.isNotEmpty) _fitBounds(pts);
-                            },
-                            child: Container(
-                              width: 40, height: 40,
-                              decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.65), borderRadius: BorderRadius.circular(12)),
-                              child: const Icon(Icons.fit_screen, color: Colors.white, size: 20),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                          GestureDetector(
-                            onTap: _recenter,
-                            child: Container(
-                              width: 40, height: 40,
-                              decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.65), borderRadius: BorderRadius.circular(12)),
-                              child: const Icon(Icons.my_location, color: Colors.white, size: 20),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ]),
-                ),
-              ),
-            ),
-            // Panneau bas : fond transparent (#0D0D0D du scaffold), même maxWidth que la carte
-            SingleChildScrollView(
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 1400),
-                  child: _buildBottomPanel(),
-                ),
-              ),
-            ),
-          ],
-        ),
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          _buildMap(),
+          Positioned(
+            top: 0, left: 0, right: 0,
+            child: _buildTopOverlay(isMobileLayout, topPadding),
+          ),
+          Positioned(
+            bottom: 0, left: 0, right: 0,
+            child: isMobileLayout
+                ? _buildMobileBottomPanel(bottomPadding)
+                : _buildDesktopBottomBar(bottomPadding),
+          ),
+        ],
       ),
     );
-  }
-}
-
-class _StatItem extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String value;
-  final Color? valueColor;
-  final bool large;
-  const _StatItem({required this.icon, required this.label, required this.value, this.valueColor, this.large = false});
-
-  @override
-  Widget build(BuildContext context) {
-    final color = valueColor ?? const Color(0xFFFF8A00);
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(icon, color: color, size: large ? 26 : 18),
-      const SizedBox(height: 4),
-      Text(value, style: TextStyle(fontSize: large ? 28 : 15, fontWeight: FontWeight.bold, color: color)),
-      const SizedBox(height: 2),
-      Text(label, style: TextStyle(fontSize: large ? 12 : 11, color: Colors.white54)),
-    ]);
   }
 }

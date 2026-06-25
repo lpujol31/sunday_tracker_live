@@ -8,11 +8,14 @@ Ce tracé est partagé au départ par le participant
 ## Déploiment
 flutter clean
 flutter pub get
-flutter build web
 flutter build web --release
+flutter build web --release --no-wasm-dry-run
 firebase deploy
 
 flutter run -d chrome
+
+## Debug si cache corrompu
+flutter clean && flutter pub get && flutter build web --release --no-wasm-dry-run
 
 ## Stack
 ### Github
