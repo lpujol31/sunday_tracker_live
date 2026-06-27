@@ -444,6 +444,8 @@ class _LivePageState extends State<LivePage> {
                     'created_at': w['timestamp'] as String?,
                     'comment': (w['note'] as String? ?? '').isNotEmpty ? w['note'] : null,
                     'photo_url': null, // chemins locaux téléphone — inaccessibles depuis le web
+                    'lat': w['lat'],
+                    'lng': w['lng'],
                   })
               .toList();
         }
@@ -647,9 +649,31 @@ class _LivePageState extends State<LivePage> {
             PolylineLayer(polylines: List.generate(points.length - 1, (i) => Polyline(points: [points[i], points[i + 1]], strokeWidth: 5, color: gradientColors[i]))),
           MarkerLayer(markers: [
             if (points.isNotEmpty)
-              Marker(point: points.first, width: 22, height: 22, child: Container(decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.25), shape: BoxShape.circle, border: Border.all(color: const Color(0xFFFF8A00), width: 2), boxShadow: [BoxShadow(color: const Color(0xFFFF8A00).withValues(alpha: 0.85), blurRadius: 8)]))),
+              Marker(
+                point: points.first, width: 26, height: 26,
+                child: Container(
+                  decoration: BoxDecoration(color: const Color(0xFFFF8A00), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFFFF8A00).withValues(alpha: 0.6), blurRadius: 8)]),
+                  child: const Icon(Icons.play_arrow, color: Colors.white, size: 16),
+                ),
+              ),
+            for (final cp in _checkpoints)
+              if (cp['lat'] != null && cp['lng'] != null)
+                Marker(
+                  point: LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble()),
+                  width: 26, height: 26,
+                  child: Container(
+                    decoration: BoxDecoration(color: const Color(0xFF3B82F6), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF3B82F6).withValues(alpha: 0.6), blurRadius: 8)]),
+                    child: const Icon(Icons.location_on, color: Colors.white, size: 16),
+                  ),
+                ),
             if (points.length > 1)
-              Marker(point: points.last, width: 26, height: 26, child: Container(decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.25), shape: BoxShape.circle, border: Border.all(color: const Color(0xFF6D28D9), width: 2), boxShadow: [BoxShadow(color: const Color(0xFF6D28D9).withValues(alpha: 0.85), blurRadius: 8)]), child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 18))),
+              Marker(
+                point: points.last, width: 26, height: 26,
+                child: Container(
+                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF6D28D9).withValues(alpha: 0.6), blurRadius: 8)]),
+                  child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
+                ),
+              ),
             Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
           ]),
         ],
@@ -919,10 +943,11 @@ class _LivePageState extends State<LivePage> {
             ),
           ),
           const Spacer(),
-          SizedBox(
-            width: 440,
-            child: _buildPositionCard(),
-          ),
+          if (!_waypointsPanelOpen)
+            SizedBox(
+              width: 440,
+              child: _buildPositionCard(),
+            ),
         ],
       ),
       ),
@@ -1194,24 +1219,24 @@ class _LivePageState extends State<LivePage> {
     String? photoUrl,
     required bool isLast,
   }) {
-    final Color dotBorder;
-    final Widget? dotInner;
+    final Color dotColor;
+    final Widget dotInner;
     switch (type) {
       case 'start':
-        dotBorder = const Color(0xFFFF8A00);
-        dotInner = null;
+        dotColor = const Color(0xFFFF8A00);
+        dotInner = const Icon(Icons.play_arrow, color: Colors.white, size: 12);
         break;
       case 'end':
-        dotBorder = const Color(0xFF6D28D9);
-        dotInner = const Icon(Icons.sports_score_sharp, color: Color(0xFF6D28D9), size: 11);
+        dotColor = const Color(0xFF6D28D9);
+        dotInner = const Icon(Icons.sports_score_sharp, color: Colors.white, size: 12);
         break;
       case 'current':
-        dotBorder = const Color(0xFF4ADE80);
-        dotInner = const Icon(Icons.location_on, color: Color(0xFF4ADE80), size: 11);
+        dotColor = const Color(0xFF4ADE80);
+        dotInner = const Icon(Icons.location_on, color: Colors.white, size: 12);
         break;
       default:
-        dotBorder = const Color(0xFF4F9CFF);
-        dotInner = null;
+        dotColor = const Color(0xFF3B82F6);
+        dotInner = const Icon(Icons.location_on, color: Colors.white, size: 12);
     }
     final timeStr = time != null
         ? '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}'
@@ -1226,13 +1251,12 @@ class _LivePageState extends State<LivePage> {
             child: Column(
               children: [
                 Container(
-                  width: 20, height: 20,
+                  width: 22, height: 22,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0D0D0D),
+                    color: dotColor,
                     shape: BoxShape.circle,
-                    border: Border.all(color: dotBorder, width: 2),
                   ),
-                  child: dotInner != null ? Center(child: dotInner) : null,
+                  child: Center(child: dotInner),
                 ),
                 if (!isLast)
                   Expanded(
@@ -1429,9 +1453,14 @@ class _LivePageState extends State<LivePage> {
         Container(height: 1, color: Colors.white12),
         Expanded(
           child: SingleChildScrollView(
-            padding: EdgeInsets.fromLTRB(14, 14, 14, 14 + bottomPadding),
+            padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
             child: _buildWaypointTimeline(),
           ),
+        ),
+        Container(height: 1, color: Colors.white12),
+        Padding(
+          padding: EdgeInsets.fromLTRB(14, 12, 14, 14 + bottomPadding),
+          child: _buildPositionCard(),
         ),
       ]),
     );
