@@ -10,6 +10,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:intl/intl.dart';
+import 'package:google_fonts/google_fonts.dart';
 
 const List<Map<String, dynamic>> kMapStyles = [
   {
@@ -97,6 +98,9 @@ class _LivePageState extends State<LivePage> {
 
   final shareCode = Uri.base.queryParameters['code'];
 
+  List<Map<String, dynamic>> _checkpoints = [];
+  bool _waypointsPanelOpen = false;
+
   @override
   void initState() {
     super.initState();
@@ -116,12 +120,42 @@ class _LivePageState extends State<LivePage> {
   }
 
   String _formatSinceLastUpdate() {
+    if (_isFinished && lastUpdate != null) {
+      final dt = lastUpdate!.toLocal();
+      return 'Arrivée à ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    }
+    if (rideStatus == 'unknown' || lastUpdate == null) return 'Position inconnue';
     final s = _sinceLastUpdate.inSeconds;
     if (s < 60) return 'il y a $s s';
     final m = _sinceLastUpdate.inMinutes;
     if (m < 60) return 'il y a $m min';
     final h = _sinceLastUpdate.inHours;
     return 'il y a ${h}h${(m - h * 60).toString().padLeft(2, '0')}';
+  }
+
+  Widget _buildStatusPill() {
+    final color = getStatusColor();
+    final icon = getStatusIcon();
+    final label = _isFinished ? 'Ride terminé'
+        : rideStatus == 'in_progress' ? 'En cours'
+        : rideStatus == 'paused' ? 'En pause'
+        : 'Statut du ride indisponible';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withValues(alpha: 0.5), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: color, size: 11),
+          const SizedBox(width: 5),
+          Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+        ],
+      ),
+    );
   }
 
   bool get _isFinished => rideStatus == 'finished';
@@ -141,11 +175,12 @@ class _LivePageState extends State<LivePage> {
     startAutoRefresh();
   }
 
-  /// Stoppe proprement le polling et le ticker quand le ride est terminé.
   void _stopPollingIfFinished() {
     if (_isFinished) {
       refreshTimer?.cancel();
       refreshTimer = null;
+      _tickerTimer?.cancel();
+      _tickerTimer = null;
     }
   }
 
@@ -222,7 +257,10 @@ class _LivePageState extends State<LivePage> {
   Widget _buildVersionBadge() {
     final parts = appVersion.split('+');
     final version = parts.first;
-    final build = parts.length > 1 ? parts[1].split(' ').first : '';
+    final rawBuild = parts.length > 1 ? parts[1].split(' ').first : '';
+    final build = rawBuild.length == 10
+        ? '${rawBuild.substring(0, 8)}.${rawBuild.substring(8)}'
+        : rawBuild;
     return Container(
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.65),
@@ -337,26 +375,23 @@ class _LivePageState extends State<LivePage> {
     mapController.move(LatLng(latitude!, longitude!), 15);
   }
 
-  /// Met à jour le titre de l'onglet selon le statut du ride.
   void _updateDocumentMeta(String status) {
     try {
-      final emoji = status == 'in_progress'
-          ? '🔴'
-          : status == 'paused'
-              ? '⏸'
-              : status == 'finished'
-                  ? '✅'
-                  : '📍';
-      final label = status == 'in_progress'
-          ? 'En cours'
-          : status == 'paused'
-              ? 'En pause'
-              : status == 'finished'
-                  ? 'Terminé'
-                  : 'Sunday Tracker';
-      html.document.title = '$emoji Sunday Tracker Live — $label';
-      // Pas de modification du favicon : les navigateurs dupliquent
-      // les emojis SVG injectés dynamiquement.
+      final icon = status == 'finished'
+          ? '🟢'
+          : status == 'in_progress'
+              ? '🔵'
+              : status == 'paused'
+                  ? '🟡'
+                  : '⚪';
+      final label = status == 'finished'
+          ? 'Ride terminé'
+          : status == 'in_progress'
+              ? 'En cours'
+              : status == 'paused'
+                  ? 'En pause'
+                  : 'Statut du ride indisponible';
+      html.document.title = '$icon $label';
     } catch (_) {}
   }
 
@@ -385,7 +420,7 @@ class _LivePageState extends State<LivePage> {
     if (!isLoading) setState(() => isRefreshing = true);
     try {
       final supabase = Supabase.instance.client;
-      final session = await supabase.from('safety_sessions').select('id, status, started_at').eq('share_code', shareCode!).single();
+      final session = await supabase.from('safety_sessions').select('id, status, started_at, ride_json').eq('share_code', shareCode!).single();
       final newStatus = session['status'] ?? 'unknown';
       _checkStatusChange(newStatus);
       rideStatus = newStatus;
@@ -396,10 +431,28 @@ class _LivePageState extends State<LivePage> {
         setState(() { errorMessage = 'Aucune position disponible'; isLoading = false; isRefreshing = false; });
         return;
       }
+      // Les waypoints sont stockés localement sur le téléphone pendant le ride.
+      // Ils arrivent dans safety_sessions.ride_json['waypoints'] uniquement à la fin.
+      List<Map<String, dynamic>> parsedCheckpoints = [];
+      try {
+        final rideJson = session['ride_json'] as Map<String, dynamic>?;
+        final rawWaypoints = rideJson?['waypoints'] as List<dynamic>?;
+        if (rawWaypoints != null) {
+          parsedCheckpoints = rawWaypoints
+              .whereType<Map<String, dynamic>>()
+              .map((w) => {
+                    'created_at': w['timestamp'] as String?,
+                    'comment': (w['note'] as String? ?? '').isNotEmpty ? w['note'] : null,
+                    'photo_url': null, // chemins locaux téléphone — inaccessibles depuis le web
+                  })
+              .toList();
+        }
+      } catch (_) {}
       _computeStats(parsedPositions);
       final latestPosition = parsedPositions.first;
       setState(() {
         tracePositions = parsedPositions;
+        _checkpoints = parsedCheckpoints;
         latitude = (latestPosition['latitude'] as num).toDouble();
         longitude = (latestPosition['longitude'] as num).toDouble();
         lastUpdate = DateTime.tryParse(latestPosition['created_at']);
@@ -622,7 +675,7 @@ class _LivePageState extends State<LivePage> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text('Sunday Tracker Live',
-                    style: TextStyle(color: Colors.white, fontSize: isMobile ? 14 : 28, fontWeight: FontWeight.bold, shadows: [Shadow(color: Colors.black54, blurRadius: 4)])),
+                    style: GoogleFonts.robotoCondensed(color: Colors.white, fontSize: isMobile ? 14 : 36, fontWeight: FontWeight.w700, shadows: [const Shadow(color: Colors.black54, blurRadius: 4)])),
                 const SizedBox(height: 6),
                 _buildVersionBadge(),
               ],
@@ -664,11 +717,6 @@ class _LivePageState extends State<LivePage> {
               child: const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.more_vert, color: Colors.orange, size: 22)),
             ),
           ],
-          Row(mainAxisSize: MainAxisSize.min, children: [
-            Icon(getStatusIcon(), color: getStatusColor(), size: isMobile ? 18 : 20),
-            const SizedBox(width: 6),
-            Text(getStatusLabel(), style: TextStyle(color: getStatusColor(), fontSize: isMobile ? 18 : 20, fontWeight: FontWeight.bold)),
-          ]),
         ],
       ),
     );
@@ -730,9 +778,16 @@ class _LivePageState extends State<LivePage> {
             const Text('DERNIÈRE POSITION CONNUE',
               style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
             const Spacer(),
-            if (!_isFinished) _buildSignalIndicator(),
+            if (rideStatus == 'in_progress' || rideStatus == 'paused')
+              _buildSignalIndicator()
+            else if (_isFinished)
+              _buildStatusPill(),
           ]),
           const SizedBox(height: 6),
+          if (!_isFinished) ...[
+            _buildStatusPill(),
+            const SizedBox(height: 6),
+          ],
           Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
             const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 20),
             const SizedBox(width: 8),
@@ -878,7 +933,7 @@ class _LivePageState extends State<LivePage> {
     return Padding(
       padding: EdgeInsets.fromLTRB(14, 0, 14, 12 + bottomPadding),
       child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
         decoration: BoxDecoration(
           color: const Color(0xFF1B1B1B),
           borderRadius: BorderRadius.circular(16),
@@ -887,6 +942,28 @@ class _LivePageState extends State<LivePage> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Waypoints trigger
+            GestureDetector(
+              onTap: () => _showWaypointsBottomSheet(context),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.route, color: Color(0xFF4F9CFF), size: 14),
+                  const SizedBox(width: 8),
+                  const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
+                  const SizedBox(width: 4),
+                  Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 12)),
+                  const Spacer(),
+                  const Icon(Icons.keyboard_arrow_up, color: Colors.white38, size: 18),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 8),
             // Controls row
             Row(
               children: [
@@ -925,9 +1002,7 @@ class _LivePageState extends State<LivePage> {
               ],
             ),
             const SizedBox(height: 8),
-            Container(height: 1, color: Colors.white24),
-            const SizedBox(height: 10),
-            // Stats row
+            // Stats row (sans séparateur au-dessus)
             Row(
               children: [
                 Expanded(child: _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters))),
@@ -955,25 +1030,34 @@ class _LivePageState extends State<LivePage> {
                 )),
               ],
             ),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
             Container(height: 1, color: Colors.white12),
-            const SizedBox(height: 10),
+            const SizedBox(height: 8),
             // Position header
             Row(children: [
               const Text('DERNIÈRE POSITION CONNUE',
                 style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
               const Spacer(),
-              if (!_isFinished) _buildSignalIndicator(),
+              if (rideStatus == 'in_progress' || rideStatus == 'paused')
+                _buildSignalIndicator()
+              else if (_isFinished)
+                _buildStatusPill(),
             ]),
-            const SizedBox(height: 8),
-            // Position + date/heure sur une ligne
+            if (!_isFinished) ...[
+              const SizedBox(height: 4),
+              _buildStatusPill(),
+            ],
+            const SizedBox(height: 4),
+            // Position
             Row(children: [
               const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 18),
               const SizedBox(width: 6),
               Text(_formatSinceLastUpdate(),
                 style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-              const Spacer(),
-              if (lastUpdate != null) ...[
+            ]),
+            if (lastUpdate != null) ...[
+              const SizedBox(height: 4),
+              Row(children: [
                 const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
                 const SizedBox(width: 5),
                 Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
@@ -982,9 +1066,9 @@ class _LivePageState extends State<LivePage> {
                 const SizedBox(width: 5),
                 Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
                   style: const TextStyle(color: Colors.white60, fontSize: 11)),
-              ],
-            ]),
-            const SizedBox(height: 12),
+              ]),
+            ],
+            const SizedBox(height: 8),
             // Boutons
             Row(children: [
               Expanded(
@@ -1092,6 +1176,269 @@ class _LivePageState extends State<LivePage> {
     ]);
   }
 
+  // ── Waypoints ─────────────────────────────────────────────────────────────
+
+  int get _waypointCount {
+    int n = 0;
+    if (tracePositions.isNotEmpty) n++;
+    n += _checkpoints.length;
+    if (tracePositions.length > 1 || _isFinished) n++;
+    return n;
+  }
+
+  Widget _buildTimelinePoint({
+    required String type,
+    required String label,
+    DateTime? time,
+    String? comment,
+    String? photoUrl,
+    required bool isLast,
+  }) {
+    final Color dotBorder;
+    final Widget? dotInner;
+    switch (type) {
+      case 'start':
+        dotBorder = const Color(0xFFFF8A00);
+        dotInner = null;
+        break;
+      case 'end':
+        dotBorder = const Color(0xFF6D28D9);
+        dotInner = const Icon(Icons.sports_score_sharp, color: Color(0xFF6D28D9), size: 11);
+        break;
+      case 'current':
+        dotBorder = const Color(0xFF4ADE80);
+        dotInner = const Icon(Icons.location_on, color: Color(0xFF4ADE80), size: 11);
+        break;
+      default:
+        dotBorder = const Color(0xFF4F9CFF);
+        dotInner = null;
+    }
+    final timeStr = time != null
+        ? '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}'
+        : '--:--';
+
+    return IntrinsicHeight(
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 26,
+            child: Column(
+              children: [
+                Container(
+                  width: 20, height: 20,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0D0D0D),
+                    shape: BoxShape.circle,
+                    border: Border.all(color: dotBorder, width: 2),
+                  ),
+                  child: dotInner != null ? Center(child: dotInner) : null,
+                ),
+                if (!isLast)
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 3),
+                      child: Center(child: Container(width: 2, color: Colors.white12)),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.only(top: 1, bottom: isLast ? 0 : 20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(children: [
+                    Expanded(child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700))),
+                    Text(timeStr, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                  ]),
+                  if (comment != null && comment.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    Text(comment, style: const TextStyle(color: Colors.white60, fontSize: 12, height: 1.4)),
+                  ],
+                  if (photoUrl != null && photoUrl.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.network(
+                        photoUrl, height: 80, width: double.infinity, fit: BoxFit.cover,
+                        errorBuilder: (context, error, stack) => const SizedBox.shrink(),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildWaypointTimeline() {
+    if (tracePositions.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.all(16),
+        child: Text('Aucun point disponible', style: TextStyle(color: Colors.white38, fontSize: 13)),
+      );
+    }
+
+    final departurePos = tracePositions.last;
+    final latestPos = tracePositions.first;
+    final departureTime = DateTime.tryParse(departurePos['created_at'] ?? '')?.toLocal();
+    final latestTime = DateTime.tryParse(latestPos['created_at'] ?? '')?.toLocal();
+    final hasEndPoint = tracePositions.length > 1 || _isFinished;
+    final total = 1 + _checkpoints.length + (hasEndPoint ? 1 : 0);
+    int idx = 0;
+
+    final widgets = <Widget>[];
+
+    widgets.add(_buildTimelinePoint(
+      type: 'start', label: 'Départ', time: departureTime,
+      isLast: ++idx == total,
+    ));
+
+    for (final cp in _checkpoints) {
+      final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
+      widgets.add(_buildTimelinePoint(
+        type: 'checkpoint', label: 'Point mémorisé', time: dt,
+        comment: cp['comment'] as String?,
+        photoUrl: cp['photo_url'] as String?,
+        isLast: ++idx == total,
+      ));
+    }
+
+    if (hasEndPoint) {
+      widgets.add(_buildTimelinePoint(
+        type: _isFinished ? 'end' : 'current',
+        label: _isFinished ? 'Arrivée' : 'Dernière position',
+        time: latestTime,
+        isLast: true,
+      ));
+    }
+
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: widgets);
+  }
+
+  void _showWaypointsBottomSheet(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (_) => DraggableScrollableSheet(
+        initialChildSize: 0.45,
+        minChildSize: 0.22,
+        maxChildSize: 0.88,
+        snap: true,
+        snapSizes: const [0.22, 0.45, 0.88],
+        builder: (ctx, scrollCtrl) => Container(
+          decoration: const BoxDecoration(
+            color: Color(0xFF18181B),
+            borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+          ),
+          child: Column(children: [
+            const SizedBox(height: 10),
+            Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
+            const SizedBox(height: 12),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(children: [
+                const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
+                const SizedBox(width: 6),
+                Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+                const Spacer(),
+                GestureDetector(
+                  onTap: () => Navigator.pop(ctx),
+                  child: Container(
+                    width: 28, height: 28,
+                    decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
+                    child: const Icon(Icons.close, color: Colors.white60, size: 15),
+                  ),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 14),
+            Expanded(
+              child: SingleChildScrollView(
+                controller: scrollCtrl,
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
+                child: _buildWaypointTimeline(),
+              ),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildWaypointsTab() {
+    return GestureDetector(
+      onTap: () => setState(() => _waypointsPanelOpen = true),
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1B1B1B),
+          borderRadius: const BorderRadius.only(
+            topLeft: Radius.circular(10),
+            bottomLeft: Radius.circular(10),
+          ),
+          border: Border.all(color: Colors.white12),
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.4), blurRadius: 12)],
+        ),
+        child: RotatedBox(
+          quarterTurns: 3,
+          child: Text(
+            'Points de passage · $_waypointCount',
+            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.2),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDesktopWaypointsPanel(double topPadding, double bottomPadding) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFF0D0D0D).withValues(alpha: 0.96),
+        border: const Border(left: BorderSide(color: Colors.white12)),
+        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 20, offset: const Offset(-4, 0))],
+      ),
+      child: Column(children: [
+        SizedBox(height: topPadding + 12),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+          child: Row(children: [
+            const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
+            const SizedBox(width: 6),
+            Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+            const Spacer(),
+            GestureDetector(
+              onTap: () => setState(() => _waypointsPanelOpen = false),
+              child: Container(
+                width: 28, height: 28,
+                decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
+                child: const Icon(Icons.close, color: Colors.white60, size: 15),
+              ),
+            ),
+          ]),
+        ),
+        Container(height: 1, color: Colors.white12),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(14, 14, 14, 14 + bottomPadding),
+            child: _buildWaypointTimeline(),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  // ── Build ──────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     if (isLoading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -1118,6 +1465,30 @@ class _LivePageState extends State<LivePage> {
                 ? _buildMobileBottomPanel(bottomPadding)
                 : _buildDesktopBottomBar(bottomPadding),
           ),
+          // Desktop: tab repliable + panel droit
+          if (!isMobileLayout) ...[
+            Positioned(
+              right: 0,
+              top: topPadding + 80,
+              child: IgnorePointer(
+                ignoring: _waypointsPanelOpen,
+                child: AnimatedOpacity(
+                  duration: const Duration(milliseconds: 200),
+                  opacity: _waypointsPanelOpen ? 0.0 : 1.0,
+                  child: _buildWaypointsTab(),
+                ),
+              ),
+            ),
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 250),
+              curve: Curves.easeInOut,
+              top: 0,
+              bottom: 0,
+              right: _waypointsPanelOpen ? 0 : -340,
+              width: 340,
+              child: _buildDesktopWaypointsPanel(topPadding, bottomPadding),
+            ),
+          ],
         ],
       ),
     );

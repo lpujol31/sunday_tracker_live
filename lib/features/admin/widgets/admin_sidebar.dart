@@ -1,18 +1,42 @@
 import 'package:flutter/material.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../../../core/theme/admin_theme.dart';
 import '../../../core/auth/auth_service.dart';
 
-class AdminSidebar extends StatelessWidget {
+class AdminSidebar extends StatefulWidget {
   final String activeSection;
   final ValueChanged<String> onSectionChanged;
   const AdminSidebar({super.key, required this.activeSection, required this.onSectionChanged});
 
+  @override
+  State<AdminSidebar> createState() => _AdminSidebarState();
+}
+
+class _AdminSidebarState extends State<AdminSidebar> {
   static const _items = [
     _NavItem('cleanup', Icons.delete_sweep_outlined, 'Nettoyage'),
     _NavItem('users',   Icons.people_outline,        'Utilisateurs'),
     _NavItem('jobs',    Icons.terminal_outlined,      'Jobs'),
     _NavItem('logs',    Icons.receipt_long_outlined,  'Logs'),
   ];
+
+  String? _version;
+  String? _buildNumber;
+
+  @override
+  void initState() {
+    super.initState();
+    PackageInfo.fromPlatform().then((info) {
+      if (!mounted) return;
+      final raw = info.buildNumber;
+      final formatted = raw.length == 10
+          ? '${raw.substring(0, 8)}.${raw.substring(8)}'
+          : raw;
+      setState(() { _version = info.version; _buildNumber = formatted; });
+    }).catchError((_) {
+      if (mounted) setState(() { _version = '—'; _buildNumber = ''; });
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -34,8 +58,18 @@ class AdminSidebar extends StatelessWidget {
         ),
         const Divider(color: AdminColors.border, height: 1),
         const SizedBox(height: 12),
-        ..._items.map((item) => _SidebarTile(item: item, isActive: activeSection == item.id, onTap: () => onSectionChanged(item.id))),
+        ..._items.map((item) => _SidebarTile(item: item, isActive: widget.activeSection == item.id, onTap: () => widget.onSectionChanged(item.id))),
         const Spacer(),
+        if (_version != null)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
+            child: Text(
+              _buildNumber != null && _buildNumber!.isNotEmpty
+                  ? 'v$_version\nbuild $_buildNumber'
+                  : 'v$_version',
+              style: const TextStyle(color: Color(0xFF9CA3AF), fontSize: 11, letterSpacing: 0.2, height: 1.5),
+            ),
+          ),
         const Divider(color: AdminColors.border, height: 1),
         Padding(
           padding: const EdgeInsets.all(12),

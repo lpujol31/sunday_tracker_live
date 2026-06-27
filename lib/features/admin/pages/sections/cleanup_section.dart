@@ -12,10 +12,6 @@ class CleanupSection extends StatefulWidget {
 }
 
 class _CleanupSectionState extends State<CleanupSection> {
-  // ── Filtres ────────────────────────────────────────────────────────────────
-  String _selectedTable = 'safety_positions';
-  String _selectedStatus = 'Tous les statuts';
-
   // Seuils configurables (remplacent les constantes en dur)
   int _thresholdInProgressHours = 48;
   int _thresholdPausedDays = 7;
@@ -29,11 +25,15 @@ class _CleanupSectionState extends State<CleanupSection> {
   // ── Résultats ──────────────────────────────────────────────────────────────
   int _orphanPositions = 0;
   int _ghostSessions = 0;
+  int _orphanRides = 0;
   double _estimatedMb = 0;
   final List<_PreviewRow> _previewRows = [];
 
   // Détail des sessions fantômes récupérées depuis Supabase
   final List<Map<String, dynamic>> _ghostDetails = [];
+
+  // IDs de sessions référencées dans rides mais inexistantes dans safety_sessions
+  final List<String> _orphanRideSessionIds = [];
 
   // ── Analyse ────────────────────────────────────────────────────────────────
   Future<void> _analyze() async {
@@ -95,15 +95,38 @@ class _CleanupSectionState extends State<CleanupSection> {
       final ghostPausedList = List<Map<String, dynamic>>.from(ghostPausedRows);
       final allGhosts = [...ghostInProgressList, ...ghostPausedList];
 
-      final estimatedBytes = orphanCount * 200 + allGhosts.length * 500;
+      // 4. Rides avec safetySessionId inexistant dans safety_sessions
+      final ridesData = await supabase.from('rides').select('ride_json');
+      final allRidesJson = List<Map<String, dynamic>>.from(ridesData);
+      final rideSessionRefs = allRidesJson
+          .map((r) => (r['ride_json'] as Map?)?['safetySessionId'] as String?)
+          .whereType<String>()
+          .toSet()
+          .toList();
+
+      final deadRideSessionIds = <String>[];
+      if (rideSessionRefs.isNotEmpty) {
+        final existingSessions = await supabase
+            .from('safety_sessions')
+            .select('id')
+            .inFilter('id', rideSessionRefs);
+        final existingIds = (existingSessions as List).map((r) => r['id'] as String).toSet();
+        deadRideSessionIds.addAll(rideSessionRefs.where((ref) => !existingIds.contains(ref)));
+      }
+
+      final estimatedBytes = orphanCount * 200 + allGhosts.length * 500 + deadRideSessionIds.length * 5000;
 
       setState(() {
         _orphanPositions = orphanCount;
         _ghostSessions = allGhosts.length;
+        _orphanRides = deadRideSessionIds.length;
         _estimatedMb = estimatedBytes / (1024 * 1024);
         _ghostDetails
           ..clear()
           ..addAll(allGhosts);
+        _orphanRideSessionIds
+          ..clear()
+          ..addAll(deadRideSessionIds);
         _previewRows
           ..clear()
           ..addAll([
@@ -113,6 +136,8 @@ class _CleanupSectionState extends State<CleanupSection> {
               _PreviewRow('safety_sessions statut in_progress > ${_thresholdInProgressHours}h', ghostInProgressList.length),
             if (ghostPausedList.isNotEmpty)
               _PreviewRow('safety_sessions statut paused > $_thresholdPausedDays jours', ghostPausedList.length),
+            if (deadRideSessionIds.isNotEmpty)
+              _PreviewRow('rides avec safetySessionId introuvable', deadRideSessionIds.length),
           ]);
         _analyzed = true;
       });
@@ -140,6 +165,20 @@ class _CleanupSectionState extends State<CleanupSection> {
       // Récupère les IDs des sessions fantômes à supprimer
       final ghostIds = _ghostDetails.map((s) => s['id'] as String).toList();
 
+      // ÉTAPE 0 — Supprimer les rides liés à des sessions fantômes ou à des sessions mortes
+      final allDeadSessionIds = {...ghostIds, ..._orphanRideSessionIds};
+      if (allDeadSessionIds.isNotEmpty) {
+        final ridesData = await supabase.from('rides').select('ride_json, user_id, started_at');
+        for (final r in (ridesData as List)) {
+          final sessionId = (r['ride_json'] as Map?)?['safetySessionId'] as String?;
+          if (sessionId != null && allDeadSessionIds.contains(sessionId)) {
+            await supabase.from('rides').delete()
+                .eq('user_id', r['user_id'] as String)
+                .eq('started_at', r['started_at'] as String);
+          }
+        }
+      }
+
       // ÉTAPE 1 — Supprimer d'abord les positions liées aux sessions fantômes
       // (contrainte FK : safety_positions.session_id → safety_sessions.id)
       if (ghostIds.isNotEmpty) {
@@ -162,24 +201,34 @@ class _CleanupSectionState extends State<CleanupSection> {
       }
 
       // ÉTAPE 3 — Supprimer les sessions fantômes (maintenant sans positions)
-      await supabase.from('safety_sessions').delete()
+      final deletedInProgress = await supabase.from('safety_sessions')
+          .delete()
           .isFilter('ended_at', null).eq('status', 'in_progress')
-          .lt('started_at', cutoff48h.toIso8601String());
+          .lt('started_at', cutoff48h.toIso8601String())
+          .select('id');
 
-      await supabase.from('safety_sessions').delete()
+      final deletedPaused = await supabase.from('safety_sessions')
+          .delete()
           .isFilter('ended_at', null).eq('status', 'paused')
-          .lt('started_at', cutoff7d.toIso8601String());
+          .lt('started_at', cutoff7d.toIso8601String())
+          .select('id');
+
+      final totalDeleted = (deletedInProgress as List).length + (deletedPaused as List).length;
 
       setState(() {
-        _orphanPositions = 0; _ghostSessions = 0; _estimatedMb = 0;
-        _previewRows.clear(); _ghostDetails.clear(); _analyzed = false;
+        _orphanPositions = 0; _ghostSessions = 0; _orphanRides = 0; _estimatedMb = 0;
+        _previewRows.clear(); _ghostDetails.clear(); _orphanRideSessionIds.clear(); _analyzed = false;
       });
 
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Purge effectuée avec succès ✓'),
-          backgroundColor: AdminColors.accent,
+        final msg = totalDeleted == 0
+            ? 'Aucune ligne supprimée — vérifie les politiques RLS Supabase (DELETE sur safety_sessions)'
+            : 'Purge effectuée : $totalDeleted session(s) supprimée(s) ✓';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(msg),
+          backgroundColor: totalDeleted == 0 ? AdminColors.warning : AdminColors.accent,
           behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: totalDeleted == 0 ? 8 : 4),
         ));
       }
     } catch (e) {
@@ -254,16 +303,6 @@ class _CleanupSectionState extends State<CleanupSection> {
             ),
         ]),
         const SizedBox(height: 20),
-
-        // Dropdowns
-        _Dropdown(value: _selectedTable,
-            items: const ['safety_positions', 'safety_sessions', 'Toutes les tables'],
-            onChanged: (v) => setState(() => _selectedTable = v)),
-        const SizedBox(height: 10),
-        _Dropdown(value: _selectedStatus,
-            items: const ['Tous les statuts', 'in_progress', 'paused', 'finished'],
-            onChanged: (v) => setState(() => _selectedStatus = v)),
-        const SizedBox(height: 10),
 
         // Bouton Analyser
         SizedBox(
@@ -414,11 +453,19 @@ class _CleanupSectionState extends State<CleanupSection> {
             )),
             const SizedBox(width: 10),
             Expanded(child: _MetricCard(
+              label: 'Rides incohérents',
+              value: '$_orphanRides',
+              sub: 'safetySessionId introuvable',
+              valueColor: AdminColors.danger,
+              tooltip: 'Entrées dans rides dont le champ\nride_json->safetySessionId pointe vers\nune session qui n\'existe plus.\nCes rides seront supprimés lors de la purge.',
+            )),
+            const SizedBox(width: 10),
+            Expanded(child: _MetricCard(
               label: 'Espace libérable',
               value: _estimatedMb < 0.1 ? '< 0.1 Mo' : '~${_estimatedMb.toStringAsFixed(1)} Mo',
-              sub: 'estimé (~200o/position, ~500o/session)',
+              sub: 'estimé (~200o/pos, ~500o/session, ~5ko/ride)',
               valueColor: AdminColors.textPrimary,
-              tooltip: 'Estimation basée sur :\n~200 octets par position GPS\n~500 octets par session',
+              tooltip: 'Estimation basée sur :\n~200 octets par position GPS\n~500 octets par session\n~5 000 octets par ride',
             )),
           ]),
 
@@ -594,32 +641,6 @@ class _PreviewRow {
 
 // ── Widgets ─────────────────────────────────────────────────────────────────
 
-class _Dropdown extends StatelessWidget {
-  final String value;
-  final List<String> items;
-  final ValueChanged<String> onChanged;
-  const _Dropdown({required this.value, required this.items, required this.onChanged});
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
-      decoration: BoxDecoration(color: AdminColors.surface,
-          borderRadius: BorderRadius.circular(8), border: Border.all(color: AdminColors.border)),
-      child: DropdownButtonHideUnderline(
-        child: DropdownButton<String>(
-          value: value, dropdownColor: AdminColors.surface,
-          iconEnabledColor: AdminColors.textSecondary,
-          style: const TextStyle(color: AdminColors.textPrimary, fontSize: 13),
-          isExpanded: true,
-          items: items.map((e) => DropdownMenuItem(value: e, child: Text(e))).toList(),
-          onChanged: (v) { if (v != null) onChanged(v); },
-        ),
-      ),
-    );
-  }
-}
 
 class _ThresholdInputField extends StatefulWidget {
   final int value; // always in base unit (units[0])
