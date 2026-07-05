@@ -77,6 +77,7 @@ class _LivePageState extends State<LivePage> {
   String? _previousRideStatus;
 
   List<Map<String, dynamic>> tracePositions = [];
+  List<Map<String, dynamic>> _rideJsonPoints = [];
 
   double _totalDistanceMeters = 0;
   Duration _rideDuration = Duration.zero;
@@ -100,6 +101,7 @@ class _LivePageState extends State<LivePage> {
 
   List<Map<String, dynamic>> _checkpoints = [];
   bool _waypointsPanelOpen = false;
+  bool _versionExpanded = false;
 
   @override
   void initState() {
@@ -261,47 +263,40 @@ class _LivePageState extends State<LivePage> {
     final build = rawBuild.length == 10
         ? '${rawBuild.substring(0, 8)}.${rawBuild.substring(8)}'
         : rawBuild;
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.65),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 3,
-            height: 36,
-            decoration: const BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: [Color(0xFFFF8A00), Color(0xFF6D28D9)],
-              ),
-              borderRadius: BorderRadius.only(
-                topLeft: Radius.circular(8),
-                bottomLeft: Radius.circular(8),
+    return GestureDetector(
+      onTap: () => setState(() => _versionExpanded = !_versionExpanded),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.65),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(version, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+                  if (_versionExpanded && build.isNotEmpty)
+                    Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 10)),
+                ],
               ),
             ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(8, 6, 10, 6),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(version, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
-                if (build.isNotEmpty)
-                  Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 10)),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
 
   List<LatLng> get tracePoints {
+    if (_isFinished && _rideJsonPoints.isNotEmpty) {
+      return _rideJsonPoints
+          .map((p) => LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble()))
+          .toList();
+    }
     return tracePositions.reversed
         .map((p) => LatLng(
               (p['latitude'] as num).toDouble(),
@@ -323,17 +318,20 @@ class _LivePageState extends State<LivePage> {
   }
 
   void _computeStats(List<Map<String, dynamic>> positions) {
-    final points = positions.reversed.toList();
+    // Distance : utilise ride_json.points (dense, toutes les 5m) si dispo, sinon safety_positions (toutes les 15s)
+    final distPoints = (_isFinished && _rideJsonPoints.isNotEmpty)
+        ? _rideJsonPoints.map((p) => LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble())).toList()
+        : positions.reversed.map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble())).toList();
     double dist = 0;
-    for (int i = 1; i < points.length; i++) {
-      final a = LatLng((points[i - 1]['latitude'] as num).toDouble(), (points[i - 1]['longitude'] as num).toDouble());
-      final b = LatLng((points[i]['latitude'] as num).toDouble(), (points[i]['longitude'] as num).toDouble());
-      dist += _haversineMeters(a, b);
+    for (int i = 1; i < distPoints.length; i++) {
+      dist += _haversineMeters(distPoints[i - 1], distPoints[i]);
     }
     _totalDistanceMeters = dist;
-    if (points.length >= 2) {
-      final first = DateTime.tryParse(points.first['created_at'] ?? '');
-      final last = DateTime.tryParse(points.last['created_at'] ?? '');
+    // Durée : toujours depuis les timestamps de safety_positions
+    final chronoPoints = positions.reversed.toList();
+    if (chronoPoints.length >= 2) {
+      final first = DateTime.tryParse(chronoPoints.first['created_at'] ?? '');
+      final last = DateTime.tryParse(chronoPoints.last['created_at'] ?? '');
       if (first != null && last != null) _rideDuration = last.difference(first).abs();
     }
   }
@@ -420,13 +418,19 @@ class _LivePageState extends State<LivePage> {
     if (!isLoading) setState(() => isRefreshing = true);
     try {
       final supabase = Supabase.instance.client;
-      final session = await supabase.from('safety_sessions').select('id, status, started_at, ride_json').eq('share_code', shareCode!).single();
+      final result = await supabase.rpc('get_live_session', params: {'p_share_code': shareCode!});
+      if (result == null || result['session'] == null) {
+        setState(() { errorMessage = 'missing_code'; isLoading = false; isRefreshing = false; });
+        return;
+      }
+      final session = Map<String, dynamic>.from(result['session'] as Map);
       final newStatus = session['status'] ?? 'unknown';
       _checkStatusChange(newStatus);
       rideStatus = newStatus;
       rideStartTime = DateTime.tryParse(session['started_at'] ?? '');
-      final positions = await supabase.from('safety_positions').select().eq('session_id', session['id']).order('created_at', ascending: false).limit(2500);
-      final parsedPositions = List<Map<String, dynamic>>.from(positions);
+      final parsedPositions = ((result['positions'] as List?) ?? [])
+          .map((p) => Map<String, dynamic>.from(p as Map))
+          .toList();
       if (parsedPositions.isEmpty) {
         setState(() { errorMessage = 'Aucune position disponible'; isLoading = false; isRefreshing = false; });
         return;
@@ -434,6 +438,7 @@ class _LivePageState extends State<LivePage> {
       // Les waypoints sont stockés localement sur le téléphone pendant le ride.
       // Ils arrivent dans safety_sessions.ride_json['waypoints'] uniquement à la fin.
       List<Map<String, dynamic>> parsedCheckpoints = [];
+      List<Map<String, dynamic>> parsedRideJsonPoints = [];
       try {
         final rideJson = session['ride_json'] as Map<String, dynamic>?;
         final rawWaypoints = rideJson?['waypoints'] as List<dynamic>?;
@@ -449,8 +454,27 @@ class _LivePageState extends State<LivePage> {
                   })
               .toList();
         }
+        final rawPoints = rideJson?['points'] as List<dynamic>?;
+        if (rawPoints != null) {
+          parsedRideJsonPoints = rawPoints.whereType<Map<String, dynamic>>().toList();
+        }
       } catch (_) {}
-      _computeStats(parsedPositions);
+      _rideJsonPoints = parsedRideJsonPoints;
+      // Ride terminé : lire les stats authoritatives depuis ride_json
+      bool statsFromRideJson = false;
+      if (newStatus == 'finished') {
+        try {
+          final rideJson = session['ride_json'] as Map<String, dynamic>?;
+          final distM = rideJson?['distanceMeters'];
+          final durS = rideJson?['durationSeconds'];
+          if (distM != null && durS != null) {
+            _totalDistanceMeters = (distM as num).toDouble();
+            _rideDuration = Duration(seconds: (durS as num).toInt());
+            statsFromRideJson = true;
+          }
+        } catch (_) {}
+      }
+      if (!statsFromRideJson) _computeStats(parsedPositions);
       final latestPosition = parsedPositions.first;
       setState(() {
         tracePositions = parsedPositions;
