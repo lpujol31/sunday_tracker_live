@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 // ignore: avoid_web_libraries_in_flutter
-import 'dart:html' as html show document;
+import 'dart:html' as html;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -282,6 +282,20 @@ class _LivePageState extends State<LivePage> {
                   Text(version, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
                   if (_versionExpanded && build.isNotEmpty)
                     Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 10)),
+                  if (_versionExpanded) ...[
+                    const SizedBox(height: 6),
+                    GestureDetector(
+                      onTap: _forcingUpdate ? null : _forceUpdate,
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        _forcingUpdate
+                            ? const SizedBox(width: 11, height: 11, child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFFF8A00)))
+                            : const Icon(Icons.system_update_alt, size: 12, color: Color(0xFFFF8A00)),
+                        const SizedBox(width: 5),
+                        Text(_forcingUpdate ? 'Mise à jour…' : 'Forcer la mise à jour',
+                            style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w600)),
+                      ]),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -1156,6 +1170,37 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
+  bool _forcingUpdate = false;
+
+  /// Vide le service worker + tous les caches puis recharge la page.
+  /// Équivaut à un "hard refresh" mais déclenché par l'utilisateur en un tap,
+  /// ce qui est bien plus simple à expliquer (et faisable sur mobile/tablette).
+  Future<void> _forceUpdate() async {
+    if (_forcingUpdate) return;
+    setState(() => _forcingUpdate = true);
+    try {
+      final sw = html.window.navigator.serviceWorker;
+      if (sw != null) {
+        final regs = await sw.getRegistrations();
+        for (final reg in regs) {
+          try { await reg.unregister(); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    try {
+      final caches = html.window.caches;
+      if (caches != null) {
+        final keys = await caches.keys();
+        for (final key in keys) {
+          try { await caches.delete(key); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    // Recharge la page : le nouveau service worker et les nouveaux assets
+    // seront re-téléchargés depuis le serveur.
+    html.window.location.reload();
+  }
+
   Widget _buildErrorScreen() {
     final isMissingCode = errorMessage == 'missing_code';
     final isNoPosition = errorMessage == 'Aucune position disponible';
@@ -1212,6 +1257,16 @@ class _LivePageState extends State<LivePage> {
             ])),
           ),
         ],
+        const SizedBox(height: 24),
+        TextButton.icon(
+          onPressed: _forcingUpdate ? null : _forceUpdate,
+          style: TextButton.styleFrom(foregroundColor: Colors.white54, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10)),
+          icon: _forcingUpdate
+              ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white54))
+              : const Icon(Icons.system_update_alt, size: 16),
+          label: Text(_forcingUpdate ? 'Mise à jour…' : 'Forcer la mise à jour de l\'app'),
+        ),
+        const Text('À utiliser si l\'app semble bloquée sur une ancienne version', style: TextStyle(color: Colors.white30, fontSize: 11), textAlign: TextAlign.center),
       ]))),
       Padding(padding: const EdgeInsets.only(bottom: 16), child: Text(appVersion, style: const TextStyle(color: Colors.white38, fontSize: 11))),
     ]);
