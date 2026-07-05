@@ -80,4 +80,33 @@ self.addEventListener('activate', function (event) {
 `;
 fs.writeFileSync(path.join(webDir, 'flutter_service_worker.js'), selfDestroyingSW);
 
-console.log('[check_build] ✅ Build web OK (' + total + ' fichiers). Service worker auto-destructeur installe.');
+// --- Cache-busting des fichiers d'entree a nom fixe ---
+// main.dart.js et flutter_bootstrap.js ont un nom fixe. Sans SW, un navigateur
+// qui les a un jour mis en cache "immutable" (ancien bug d'en-tetes) les garde
+// epingles jusqu'a 1 an et ne verrait jamais une mise a jour. En ajoutant
+// ?v=<build> (change a chaque build), l'URL change -> le navigateur est force de
+// re-telecharger, ce qui debloque automatiquement les utilisateurs coinces.
+// index.html est toujours en no-cache, donc il porte toujours la derniere valeur.
+let cacheBust = 'dev';
+try {
+  const version = JSON.parse(fs.readFileSync(path.join(webDir, 'version.json'), 'utf8'));
+  cacheBust = String(version.build_number || version.version || Date.now());
+} catch (e) { cacheBust = String(Date.now()); }
+
+const indexPath = path.join(webDir, 'index.html');
+let indexHtml = fs.readFileSync(indexPath, 'utf8');
+indexHtml = indexHtml.replace(
+  /src="flutter_bootstrap\.js(?:\?v=[^"]*)?"/,
+  'src="flutter_bootstrap.js?v=' + cacheBust + '"'
+);
+fs.writeFileSync(indexPath, indexHtml);
+
+const bootstrapPath = path.join(webDir, 'flutter_bootstrap.js');
+let bootstrap = fs.readFileSync(bootstrapPath, 'utf8');
+bootstrap = bootstrap.replace(
+  /"mainJsPath":"main\.dart\.js(?:\?v=[^"]*)?"/,
+  '"mainJsPath":"main.dart.js?v=' + cacheBust + '"'
+);
+fs.writeFileSync(bootstrapPath, bootstrap);
+
+console.log('[check_build] ✅ Build web OK (' + total + ' fichiers). SW auto-destructeur + cache-busting v=' + cacheBust + ' installes.');
