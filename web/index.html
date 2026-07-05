@@ -43,18 +43,28 @@
     * https://docs.flutter.dev/platform-integration/web/initialization
   -->
   <script>
-    // Recharge la page quand un nouveau service worker prend le contrôle,
-    // garantissant que les nouveaux assets sont chargés immédiatement.
+    // Sunday Tracker Live est 100% en ligne : on n'utilise PAS de service worker
+    // (build avec --pwa-strategy=none). Ce script desinscrit tout ancien service
+    // worker et vide ses caches, ce qui debloque automatiquement les utilisateurs
+    // restes coinces sur une version figee, sans aucune manip de leur part.
     if ('serviceWorker' in navigator) {
-      let reloading = false;
-      navigator.serviceWorker.addEventListener('controllerchange', () => {
-        if (!reloading) {
-          reloading = true;
-          window.location.reload();
+      navigator.serviceWorker.getRegistrations().then(function (regs) {
+        var hadSW = regs.length > 0;
+        var jobs = regs.map(function (r) { return r.unregister(); });
+        if (window.caches && caches.keys) {
+          jobs.push(caches.keys().then(function (keys) {
+            return Promise.all(keys.map(function (k) { return caches.delete(k); }));
+          }));
         }
-      });
-      // Force le navigateur à vérifier les mises à jour du SW à chaque chargement.
-      navigator.serviceWorker.ready.then(reg => reg.update());
+        Promise.all(jobs).then(function () {
+          // Si un ancien SW controlait la page, on recharge une seule fois pour
+          // repartir sur une base propre servie directement par le serveur.
+          if (hadSW && !sessionStorage.getItem('sw_cleaned')) {
+            sessionStorage.setItem('sw_cleaned', '1');
+            window.location.reload();
+          }
+        });
+      }).catch(function () {});
     }
   </script>
   <script src="flutter_bootstrap.js" async></script>
