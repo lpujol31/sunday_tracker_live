@@ -12,6 +12,14 @@ class CleanupSection extends StatefulWidget {
 }
 
 class _CleanupSectionState extends State<CleanupSection> {
+  // Bucket Supabase Storage qui héberge les photos de waypoint (miroir du mobile).
+  static const String _kWaypointBucket = 'waypoint-photos';
+
+  // Réplique exacte de la sanitisation mobile (_sanitize dans photo_sync_service) :
+  // le dossier d'un ride est `$userId/${sanitize(startTime)}`. Doit rester
+  // identique, sinon on ne retrouve pas les dossiers.
+  String _sanitizeRideId(String s) => s.replaceAll(RegExp(r'[^A-Za-z0-9]'), '_');
+
   // Seuils configurables (remplacent les constantes en dur)
   int _thresholdInProgressHours = 48;
   int _thresholdPausedDays = 7;
@@ -32,12 +40,20 @@ class _CleanupSectionState extends State<CleanupSection> {
   // Détail des sessions fantômes récupérées depuis Supabase
   final List<Map<String, dynamic>> _ghostDetails = [];
 
-  // IDs de sessions référencées dans rides mais inexistantes dans safety_sessions
+  // IDs de sessions référencées dans rides mais inexistantes dans safety_sessions.
+  // Ces rides seront RÉPARÉS (safetySessionId mis à null), pas supprimés.
   final List<String> _orphanRideSessionIds = [];
+
+  // Fichiers Storage orphelins : dossiers `waypoint-photos/$user/$ride` qui ne
+  // correspondent à aucune ligne `rides` (typiquement une sortie supprimée
+  // hors-ligne dont seul le nettoyage réseau a échoué). Chemins d'objets complets.
+  int _orphanStorageFiles = 0;
+  double _orphanStorageMb = 0;
+  final List<String> _orphanStoragePaths = [];
 
   // ── Analyse ────────────────────────────────────────────────────────────────
   Future<void> _analyze() async {
-    setState(() { _analyzing = true; _analyzed = false; _error = null; _ghostDetails.clear(); });
+    setState(() { _analyzing = true; _analyzed = false; _error = null; _ghostDetails.clear(); _orphanStoragePaths.clear(); });
 
     try {
       final supabase = Supabase.instance.client;
@@ -95,8 +111,10 @@ class _CleanupSectionState extends State<CleanupSection> {
       final ghostPausedList = List<Map<String, dynamic>>.from(ghostPausedRows);
       final allGhosts = [...ghostInProgressList, ...ghostPausedList];
 
-      // 4. Rides avec safetySessionId inexistant dans safety_sessions
-      final ridesData = await supabase.from('rides').select('ride_json');
+      // 4. Rides avec safetySessionId inexistant dans safety_sessions.
+      //    On récupère aussi user_id/started_at : nécessaires pour retrouver le
+      //    dossier Storage (étape 5) et pour la réparation lors de la purge.
+      final ridesData = await supabase.from('rides').select('ride_json, user_id, started_at');
       final allRidesJson = List<Map<String, dynamic>>.from(ridesData);
       final rideSessionRefs = allRidesJson
           .map((r) => (r['ride_json'] as Map?)?['safetySessionId'] as String?)
@@ -114,12 +132,52 @@ class _CleanupSectionState extends State<CleanupSection> {
         deadRideSessionIds.addAll(rideSessionRefs.where((ref) => !existingIds.contains(ref)));
       }
 
-      final estimatedBytes = orphanCount * 200 + allGhosts.length * 500 + deadRideSessionIds.length * 5000;
+      // 5. Fichiers Storage orphelins. On construit l'ensemble des dossiers
+      //    légitimes `$user/${sanitize(started_at)}`, puis on balaie le bucket :
+      //    tout dossier absent de cet ensemble n'appartient à aucune sortie.
+      final validFolderKeys = <String>{};
+      for (final r in allRidesJson) {
+        final uid = r['user_id'] as String?;
+        final startedAt = r['started_at'] as String?;
+        if (uid != null && startedAt != null) {
+          validFolderKeys.add('$uid/${_sanitizeRideId(startedAt)}');
+        }
+      }
+      final orphanStoragePaths = <String>[];
+      double orphanStorageBytes = 0;
+      try {
+        final storage = supabase.storage.from(_kWaypointBucket);
+        final userFolders = await storage.list();
+        for (final uf in userFolders) {
+          if (uf.metadata != null) continue; // fichier au niveau racine → ignore
+          final userId = uf.name;
+          final rideFolders = await storage.list(path: userId);
+          for (final rf in rideFolders) {
+            if (rf.metadata != null) continue; // fichier, pas un dossier de ride
+            final folderKey = '$userId/${rf.name}';
+            if (validFolderKeys.contains(folderKey)) continue; // rattaché à un ride → on garde
+            final files = await storage.list(path: folderKey);
+            for (final f in files) {
+              if (f.metadata == null) continue; // sous-dossier inattendu → ignore
+              orphanStoragePaths.add('$folderKey/${f.name}');
+              final size = f.metadata?['size'];
+              if (size is num) orphanStorageBytes += size.toDouble();
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('[CLEANUP] analyse Storage: $e');
+      }
+
+      final estimatedBytes = orphanCount * 200 + allGhosts.length * 500 +
+          deadRideSessionIds.length * 5000 + orphanStorageBytes;
 
       setState(() {
         _orphanPositions = orphanCount;
         _ghostSessions = allGhosts.length;
         _orphanRides = deadRideSessionIds.length;
+        _orphanStorageFiles = orphanStoragePaths.length;
+        _orphanStorageMb = orphanStorageBytes / (1024 * 1024);
         _estimatedMb = estimatedBytes / (1024 * 1024);
         _ghostDetails
           ..clear()
@@ -127,6 +185,9 @@ class _CleanupSectionState extends State<CleanupSection> {
         _orphanRideSessionIds
           ..clear()
           ..addAll(deadRideSessionIds);
+        _orphanStoragePaths
+          ..clear()
+          ..addAll(orphanStoragePaths);
         _previewRows
           ..clear()
           ..addAll([
@@ -137,7 +198,9 @@ class _CleanupSectionState extends State<CleanupSection> {
             if (ghostPausedList.isNotEmpty)
               _PreviewRow('safety_sessions statut paused > $_thresholdPausedDays jours', ghostPausedList.length),
             if (deadRideSessionIds.isNotEmpty)
-              _PreviewRow('rides avec safetySessionId introuvable', deadRideSessionIds.length),
+              _PreviewRow('rides à réparer (safetySessionId orphelin → nettoyé)', deadRideSessionIds.length),
+            if (orphanStoragePaths.isNotEmpty)
+              _PreviewRow('photos Storage orphelines (dossier sans ride)', orphanStoragePaths.length),
           ]);
         _analyzed = true;
       });
@@ -165,16 +228,25 @@ class _CleanupSectionState extends State<CleanupSection> {
       // Récupère les IDs des sessions fantômes à supprimer
       final ghostIds = _ghostDetails.map((s) => s['id'] as String).toList();
 
-      // ÉTAPE 0 — Supprimer les rides liés à des sessions fantômes ou à des sessions mortes
+      // ÉTAPE 0 — RÉPARER (et non supprimer) les rides liés à une session
+      // fantôme/morte. Le ride EST la donnée utilisateur ; la session n'est
+      // qu'un échafaudage de tracking live. On retire donc le safetySessionId
+      // orphelin et on conserve le ride (et ses photos).
+      int repairedRides = 0;
       final allDeadSessionIds = {...ghostIds, ..._orphanRideSessionIds};
       if (allDeadSessionIds.isNotEmpty) {
         final ridesData = await supabase.from('rides').select('ride_json, user_id, started_at');
         for (final r in (ridesData as List)) {
-          final sessionId = (r['ride_json'] as Map?)?['safetySessionId'] as String?;
+          final rawJson = r['ride_json'];
+          if (rawJson is! Map) continue;
+          final sessionId = rawJson['safetySessionId'] as String?;
           if (sessionId != null && allDeadSessionIds.contains(sessionId)) {
-            await supabase.from('rides').delete()
+            final rideJson = Map<String, dynamic>.from(rawJson.cast<String, dynamic>());
+            rideJson['safetySessionId'] = null;
+            await supabase.from('rides').update({'ride_json': rideJson})
                 .eq('user_id', r['user_id'] as String)
                 .eq('started_at', r['started_at'] as String);
+            repairedRides++;
           }
         }
       }
@@ -215,20 +287,46 @@ class _CleanupSectionState extends State<CleanupSection> {
 
       final totalDeleted = (deletedInProgress as List).length + (deletedPaused as List).length;
 
+      // ÉTAPE 4 — Supprimer les fichiers Storage orphelins (dossiers sans ride).
+      // Best-effort, par lots (l'API remove accepte une liste de chemins).
+      int deletedStorageFiles = 0;
+      if (_orphanStoragePaths.isNotEmpty) {
+        try {
+          final storage = supabase.storage.from(_kWaypointBucket);
+          const chunk = 100;
+          for (var i = 0; i < _orphanStoragePaths.length; i += chunk) {
+            final end = (i + chunk < _orphanStoragePaths.length) ? i + chunk : _orphanStoragePaths.length;
+            final slice = _orphanStoragePaths.sublist(i, end);
+            await storage.remove(slice);
+            deletedStorageFiles += slice.length;
+          }
+        } catch (e) {
+          debugPrint('[CLEANUP] purge Storage: $e');
+        }
+      }
+
       setState(() {
         _orphanPositions = 0; _ghostSessions = 0; _orphanRides = 0; _estimatedMb = 0;
-        _previewRows.clear(); _ghostDetails.clear(); _orphanRideSessionIds.clear(); _analyzed = false;
+        _orphanStorageFiles = 0; _orphanStorageMb = 0;
+        _previewRows.clear(); _ghostDetails.clear(); _orphanRideSessionIds.clear();
+        _orphanStoragePaths.clear(); _analyzed = false;
       });
 
       if (mounted) {
-        final msg = totalDeleted == 0
-            ? 'Aucune ligne supprimée — vérifie les politiques RLS Supabase (DELETE sur safety_sessions)'
-            : 'Purge effectuée : $totalDeleted session(s) supprimée(s) ✓';
+        final parts = <String>[
+          if (totalDeleted > 0) '$totalDeleted session(s)',
+          if (repairedRides > 0) '$repairedRides ride(s) réparé(s)',
+          if (deletedStorageFiles > 0) '$deletedStorageFiles photo(s) Storage',
+        ];
+        final nothingDone = totalDeleted == 0 && repairedRides == 0 && deletedStorageFiles == 0;
+        final msg = nothingDone
+            ? 'Aucune ligne supprimée — vérifie les politiques RLS Supabase (DELETE sur safety_sessions / Storage)'
+            : 'Purge effectuée : ${parts.join(' · ')} ✓';
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
           content: Text(msg),
-          backgroundColor: totalDeleted == 0 ? AdminColors.warning : AdminColors.accent,
+          backgroundColor: nothingDone ? AdminColors.warning : AdminColors.accent,
           behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: totalDeleted == 0 ? 8 : 4),
+          duration: Duration(seconds: nothingDone ? 8 : 4),
         ));
       }
     } catch (e) {
@@ -453,19 +551,27 @@ class _CleanupSectionState extends State<CleanupSection> {
             )),
             const SizedBox(width: 10),
             Expanded(child: _MetricCard(
-              label: 'Rides incohérents',
+              label: 'Rides à réparer',
               value: '$_orphanRides',
-              sub: 'safetySessionId introuvable',
+              sub: 'safetySessionId orphelin',
+              valueColor: AdminColors.warning,
+              tooltip: 'Entrées dans rides dont le champ\nride_json->safetySessionId pointe vers\nune session qui n\'existe plus.\nCes rides ne sont PAS supprimés :\nle safetySessionId orphelin est mis à null,\nle ride et ses photos sont conservés.',
+            )),
+            const SizedBox(width: 10),
+            Expanded(child: _MetricCard(
+              label: 'Photos Storage orphelines',
+              value: '$_orphanStorageFiles',
+              sub: _orphanStorageMb < 0.1 ? 'dossier sans ride' : '~${_orphanStorageMb.toStringAsFixed(1)} Mo · sans ride',
               valueColor: AdminColors.danger,
-              tooltip: 'Entrées dans rides dont le champ\nride_json->safetySessionId pointe vers\nune session qui n\'existe plus.\nCes rides seront supprimés lors de la purge.',
+              tooltip: 'Fichiers du bucket $_kWaypointBucket rangés\nsous \$user/\$ride mais dont aucune ligne rides\nne correspond (ex. sortie supprimée hors-ligne).\nCes fichiers seront supprimés du Storage.',
             )),
             const SizedBox(width: 10),
             Expanded(child: _MetricCard(
               label: 'Espace libérable',
               value: _estimatedMb < 0.1 ? '< 0.1 Mo' : '~${_estimatedMb.toStringAsFixed(1)} Mo',
-              sub: 'estimé (~200o/pos, ~500o/session, ~5ko/ride)',
+              sub: 'estimé (positions, sessions, photos)',
               valueColor: AdminColors.textPrimary,
-              tooltip: 'Estimation basée sur :\n~200 octets par position GPS\n~500 octets par session\n~5 000 octets par ride',
+              tooltip: 'Estimation basée sur :\n~200 octets par position GPS\n~500 octets par session\n+ taille réelle des photos Storage orphelines',
             )),
           ]),
 
@@ -623,6 +729,10 @@ class _CleanupSectionState extends State<CleanupSection> {
                 style: TextStyle(color: AdminColors.textSecondary, fontSize: 13)),
           ])),
         ],
+
+        // Purge par identité (rides orphelins des anciennes identités anonymes)
+        const SizedBox(height: 24),
+        const _IdentitiesPurgePanel(),
 
         const SizedBox(height: 40),
         const Center(child: Icon(Icons.keyboard_arrow_down, color: AdminColors.border, size: 28)),
@@ -821,9 +931,9 @@ class _ConfirmDialog extends StatelessWidget {
       content: RichText(text: TextSpan(
         style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13, height: 1.6),
         children: [
-          TextSpan(text: '$total lignes',
+          TextSpan(text: '$total éléments',
               style: const TextStyle(color: AdminColors.danger, fontWeight: FontWeight.w600)),
-          const TextSpan(text: ' seront supprimées définitivement de Supabase.\n\nCette action est irréversible.'),
+          const TextSpan(text: ' seront traités : sessions/positions orphelines et photos Storage supprimées définitivement, rides à safetySessionId orphelin réparés (conservés).\n\nLes suppressions sont irréversibles.'),
         ],
       )),
       actions: [
@@ -835,6 +945,264 @@ class _ConfirmDialog extends StatelessWidget {
           child: const Text('Purger'),
         ),
       ],
+    );
+  }
+}
+
+// ── Purge par identité ───────────────────────────────────────────────────────
+// Les rides s'accumulent sous plusieurs `user_id` anonymes (chaque réinstall de
+// l'app mobile crée une nouvelle identité). Les rides des anciennes identités
+// deviennent orphelins : invisibles et indélébiles côté client (RLS). L'admin
+// (is_admin()) peut ici les voir groupés par identité et purger des identités
+// entières (rides + sessions + positions + photos Storage).
+
+class _Identity {
+  final String userId;
+  int rides = 0;
+  int photos = 0;
+  DateTime? first;
+  DateTime? last;
+  _Identity(this.userId);
+}
+
+class _IdentitiesPurgePanel extends StatefulWidget {
+  const _IdentitiesPurgePanel();
+  @override
+  State<_IdentitiesPurgePanel> createState() => _IdentitiesPurgePanelState();
+}
+
+class _IdentitiesPurgePanelState extends State<_IdentitiesPurgePanel> {
+  static const String _kWaypointBucket = 'waypoint-photos';
+
+  bool _loading = false;
+  bool _loaded = false;
+  bool _purging = false;
+  String? _error;
+  final List<_Identity> _identities = [];
+  final Set<String> _selected = {};
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final supabase = Supabase.instance.client;
+      final rides = await supabase.from('rides').select('user_id, started_at, ride_json');
+      final map = <String, _Identity>{};
+      for (final r in (rides as List)) {
+        final uid = r['user_id'] as String?;
+        if (uid == null) continue;
+        final id = map.putIfAbsent(uid, () => _Identity(uid));
+        id.rides++;
+        final sa = DateTime.tryParse(r['started_at'] as String? ?? '');
+        if (sa != null) {
+          if (id.first == null || sa.isBefore(id.first!)) id.first = sa;
+          if (id.last == null || sa.isAfter(id.last!)) id.last = sa;
+        }
+        final rj = r['ride_json'];
+        if (rj is Map) {
+          final wps = rj['waypoints'];
+          if (wps is List) {
+            for (final w in wps) {
+              if (w is Map && w['photos'] is List) id.photos += (w['photos'] as List).length;
+            }
+          }
+        }
+      }
+      final list = map.values.toList()
+        ..sort((a, b) => (b.last ?? DateTime(0)).compareTo(a.last ?? DateTime(0)));
+      setState(() {
+        _identities..clear()..addAll(list);
+        _selected.clear();
+        _loaded = true;
+      });
+    } catch (e) {
+      setState(() => _error = 'Erreur de chargement : $e');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  int get _selectedRides =>
+      _identities.where((i) => _selected.contains(i.userId)).fold(0, (s, i) => s + i.rides);
+
+  Future<void> _purge() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AdminColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: AdminColors.border)),
+        title: const Row(children: [
+          Icon(Icons.warning_amber, color: AdminColors.danger, size: 20),
+          SizedBox(width: 10),
+          Expanded(child: Text('Supprimer ces identités ?', style: TextStyle(color: AdminColors.textPrimary, fontSize: 16))),
+        ]),
+        content: Text(
+          '${_selected.length} identité(s) et leurs $_selectedRides ride(s) '
+          '(+ sessions, positions GPS et photos Storage) seront supprimés DÉFINITIVEMENT.',
+          style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false),
+              child: const Text('Annuler', style: TextStyle(color: AdminColors.textSecondary))),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AdminColors.danger, foregroundColor: Colors.white),
+            child: const Text('Supprimer'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() { _purging = true; _error = null; });
+    try {
+      final supabase = Supabase.instance.client;
+      int deletedRides = 0;
+      for (final uid in _selected.toList()) {
+        // 1. Sessions de cette identité (pour supprimer leurs positions d'abord).
+        final sessions = await supabase.from('safety_sessions').select('id').eq('user_id', uid);
+        final sessionIds = (sessions as List).map((s) => s['id'] as String).toList();
+        // 2. Positions rattachées (contrainte FK) — avant les sessions.
+        if (sessionIds.isNotEmpty) {
+          await supabase.from('safety_positions').delete().inFilter('session_id', sessionIds);
+        }
+        // 3. Sessions.
+        await supabase.from('safety_sessions').delete().eq('user_id', uid);
+        // 4. Rides.
+        final deleted = await supabase.from('rides').delete().eq('user_id', uid).select('started_at');
+        deletedRides += (deleted as List).length;
+        // 5. Dossier Storage `$uid/*` (best-effort).
+        try {
+          final storage = supabase.storage.from(_kWaypointBucket);
+          final rideFolders = await storage.list(path: uid);
+          for (final rf in rideFolders) {
+            if (rf.metadata != null) continue; // fichier au niveau racine → ignore
+            final files = await storage.list(path: '$uid/${rf.name}');
+            final paths = files
+                .where((f) => f.metadata != null)
+                .map((f) => '$uid/${rf.name}/${f.name}')
+                .toList();
+            if (paths.isNotEmpty) await storage.remove(paths);
+          }
+        } catch (e) {
+          debugPrint('[CLEANUP] purge identité Storage $uid: $e');
+        }
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('$deletedRides ride(s) supprimé(s) sur ${_selected.length} identité(s) ✓'),
+          backgroundColor: AdminColors.accent, behavior: SnackBarBehavior.floating,
+        ));
+      }
+      await _load(); // recharge la liste
+    } catch (e) {
+      setState(() => _error = 'Erreur lors de la purge : $e');
+    } finally {
+      if (mounted) setState(() => _purging = false);
+    }
+  }
+
+  String _fmtDate(DateTime? dt) {
+    if (dt == null) return '—';
+    final l = dt.toLocal();
+    return '${l.day.toString().padLeft(2, '0')}/${l.month.toString().padLeft(2, '0')}/${l.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: AdminColors.surface, borderRadius: BorderRadius.circular(10), border: Border.all(color: AdminColors.border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.badge_outlined, color: AdminColors.textSecondary, size: 15),
+          const SizedBox(width: 8),
+          const Text('Rides par identité', style: TextStyle(color: AdminColors.textPrimary, fontSize: 15, fontWeight: FontWeight.w700)),
+          const Spacer(),
+          TextButton.icon(
+            onPressed: _loading ? null : _load,
+            icon: _loading
+                ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2, color: AdminColors.accent))
+                : const Icon(Icons.refresh, size: 14, color: AdminColors.textSecondary),
+            label: Text(_loaded ? 'Recharger' : 'Charger', style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        const Text(
+          'Chaque réinstall de l\'app mobile crée une nouvelle identité anonyme. '
+          'Les rides des anciennes identités sont orphelins : coche-les pour les purger entièrement.',
+          style: TextStyle(color: AdminColors.textSecondary, fontSize: 12, height: 1.5),
+        ),
+
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: AdminColors.dangerDim, borderRadius: BorderRadius.circular(8), border: Border.all(color: AdminColors.danger, width: 0.5)),
+            child: Row(children: [
+              const Icon(Icons.error_outline, color: AdminColors.danger, size: 16),
+              const SizedBox(width: 8),
+              Expanded(child: Text(_error!, style: const TextStyle(color: AdminColors.danger, fontSize: 13))),
+            ]),
+          ),
+        ],
+
+        if (_loaded && _identities.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          const Row(children: [
+            SizedBox(width: 34),
+            Expanded(flex: 3, child: Text('Identité (user_id)', style: TextStyle(color: AdminColors.textSecondary, fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 54, child: Text('Rides', style: TextStyle(color: AdminColors.textSecondary, fontSize: 11, fontWeight: FontWeight.w600))),
+            SizedBox(width: 54, child: Text('Photos', style: TextStyle(color: AdminColors.textSecondary, fontSize: 11, fontWeight: FontWeight.w600))),
+            Expanded(flex: 3, child: Text('Période', style: TextStyle(color: AdminColors.textSecondary, fontSize: 11, fontWeight: FontWeight.w600))),
+          ]),
+          const SizedBox(height: 6),
+          const Divider(color: AdminColors.border, height: 1),
+          ..._identities.map((id) {
+            final sel = _selected.contains(id.userId);
+            return InkWell(
+              onTap: () => setState(() => sel ? _selected.remove(id.userId) : _selected.add(id.userId)),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Row(children: [
+                  SizedBox(width: 34, child: Icon(sel ? Icons.check_box : Icons.check_box_outline_blank, size: 18, color: sel ? AdminColors.accent : AdminColors.textSecondary)),
+                  Expanded(flex: 3, child: Text('${id.userId.length >= 8 ? id.userId.substring(0, 8) : id.userId}…', style: const TextStyle(color: AdminColors.textPrimary, fontSize: 12, fontFamily: 'monospace'))),
+                  SizedBox(width: 54, child: Text('${id.rides}', style: const TextStyle(color: AdminColors.textPrimary, fontSize: 12))),
+                  SizedBox(width: 54, child: Text('${id.photos}', style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12))),
+                  Expanded(flex: 3, child: Text('${_fmtDate(id.first)} → ${_fmtDate(id.last)}', style: const TextStyle(color: AdminColors.textSecondary, fontSize: 11))),
+                ]),
+              ),
+            );
+          }),
+          const SizedBox(height: 14),
+          Row(children: [
+            Expanded(child: Text('${_identities.length} identité(s) · ${_identities.fold(0, (s, i) => s + i.rides)} rides au total',
+                style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12))),
+            const SizedBox(width: 10),
+            ElevatedButton.icon(
+              onPressed: (_purging || _selected.isEmpty) ? null : _purge,
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AdminColors.danger, foregroundColor: Colors.white,
+                disabledBackgroundColor: AdminColors.border, disabledForegroundColor: AdminColors.textSecondary,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              icon: _purging
+                  ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.delete_outline, size: 16),
+              label: Text(
+                _selected.isEmpty ? 'Purger la sélection' : 'Purger ${_selected.length} identité(s) · $_selectedRides rides',
+                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              ),
+            ),
+          ]),
+        ],
+
+        if (_loaded && _identities.isEmpty) ...[
+          const SizedBox(height: 12),
+          const Text('Aucun ride en base.', style: TextStyle(color: AdminColors.textSecondary, fontSize: 13)),
+        ],
+      ]),
     );
   }
 }
