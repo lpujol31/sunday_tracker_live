@@ -791,6 +791,74 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
+  /// Direction unitaire (repère écran) PERPENDICULAIRE à la trace au niveau du
+  /// waypoint `at`. Permet de décaler le pin sur le côté de la trace plutôt que
+  /// systématiquement vers le haut. Biaisée vers le haut (y < 0) pour un rendu
+  /// naturel ; si la perpendiculaire est ~horizontale, on part vers la droite.
+  Offset _leaderDirection(LatLng at) {
+    final trace = tracePoints;
+    if (trace.length < 2) return const Offset(0, -1);
+    var nearest = 0;
+    var best = double.infinity;
+    for (var i = 0; i < trace.length; i++) {
+      final dLat = trace[i].latitude - at.latitude;
+      final dLng = trace[i].longitude - at.longitude;
+      final d = dLat * dLat + dLng * dLng;
+      if (d < best) { best = d; nearest = i; }
+    }
+    final a = trace[math.max(0, nearest - 2)];
+    final b = trace[math.min(trace.length - 1, nearest + 2)];
+    final latRad = at.latitude * math.pi / 180;
+    // Tangente en repère écran (mercator local) : x ∝ Δlng·cos(lat), y ∝ -Δlat.
+    final tx = (b.longitude - a.longitude) * math.cos(latRad);
+    final ty = -(b.latitude - a.latitude);
+    final tlen = math.sqrt(tx * tx + ty * ty);
+    if (tlen < 1e-12) return const Offset(0, -1);
+    var px = -ty / tlen; // perpendiculaire = tangente tournée de 90°
+    var py = tx / tlen;
+    if (py > 1e-6) { px = -px; py = -py; } // oriente vers le haut
+    else if (py.abs() <= 1e-6 && px < 0) { px = -px; } // sinon vers la droite
+    return Offset(px, py);
+  }
+
+  /// Marker waypoint : pin flottant décalé perpendiculairement à la trace, relié
+  /// par une fine ligne à un point posé sur sa vraie position GPS. La boîte est
+  /// centrée sur la coordonnée (alignment center) et assez grande pour contenir
+  /// le décalage dans n'importe quelle direction.
+  Marker _waypointMarker(LatLng at) {
+    const color = Color(0xFF3B82F6);
+    const lead = 30.0; // longueur de la ligne de rappel (px écran)
+    const box = 120.0;
+    final dir = _leaderDirection(at);
+    final tip = Offset(dir.dx * lead, dir.dy * lead);
+    return Marker(
+      point: at,
+      width: box,
+      height: box,
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          // Ligne de rappel : du point GPS (centre) vers le pin.
+          CustomPaint(size: const Size(box, box), painter: _LeaderLinePainter(tip, color)),
+          // Point posé sur la trace = vraie position GPS du waypoint.
+          Container(
+            width: 9, height: 9,
+            decoration: BoxDecoration(
+              color: color, shape: BoxShape.circle,
+              border: Border.all(color: Colors.white, width: 1.5),
+            ),
+          ),
+          // Pin flottant, tip à l'extrémité de la ligne.
+          Transform.translate(
+            offset: Offset(tip.dx, tip.dy - 14),
+            child: const Icon(Icons.location_on, color: color, size: 28,
+                shadows: [Shadow(color: Colors.black45, blurRadius: 4)]),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildMap() {
     final points = tracePoints;
     final currentPosition = LatLng(latitude!, longitude!);
@@ -829,21 +897,18 @@ class _LivePageState extends State<LivePage> {
                   child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
                 ),
               ),
-            Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
-            // Waypoints dessinés en DERNIER = toujours au-dessus des markers
-            // structurels (départ / arrivée / position courante). Sinon un WP
-            // proche de l'arrivée (cas fréquent : point marqué en fin de sortie)
-            // est masqué par le gros pin d'arrivée et semble absent du tracé.
+            // Position courante (point rouge) : uniquement pendant le ride.
+            // Sur un ride terminé, la dernière position EST l'arrivée, déjà
+            // marquée par le pin damier — le point rouge serait redondant.
+            if (!_isFinished)
+              Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
+            // Waypoints dessinés en DERNIER (au-dessus de tout). Chaque WP est un
+            // pin flottant décalé PERPENDICULAIREMENT à la trace, relié par une
+            // fine ligne à un point posé sur sa vraie position GPS. Évite toute
+            // superposition avec les markers départ/arrivée. Cf _waypointMarker.
             for (final cp in _checkpoints)
               if (cp['lat'] != null && cp['lng'] != null)
-                Marker(
-                  point: LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble()),
-                  width: 26, height: 26,
-                  child: Container(
-                    decoration: BoxDecoration(color: const Color(0xFF3B82F6), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF3B82F6).withValues(alpha: 0.6), blurRadius: 8)]),
-                    child: const Icon(Icons.location_on, color: Colors.white, size: 16),
-                  ),
-                ),
+                _waypointMarker(LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble())),
           ]),
         ],
     );
@@ -1887,4 +1952,28 @@ class _LivePageState extends State<LivePage> {
       ),
     );
   }
+}
+
+/// Fine ligne reliant le point GPS d'un waypoint (centre de la boîte) à son pin
+/// flottant décalé (`tip`, en coordonnées écran relatives au centre).
+class _LeaderLinePainter extends CustomPainter {
+  final Offset tip;
+  final Color color;
+  const _LeaderLinePainter(this.tip, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final c = Offset(size.width / 2, size.height / 2);
+    canvas.drawLine(
+      c,
+      c + tip,
+      Paint()
+        ..color = color
+        ..strokeWidth = 1.5
+        ..strokeCap = StrokeCap.round,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_LeaderLinePainter old) => old.tip != tip || old.color != color;
 }
