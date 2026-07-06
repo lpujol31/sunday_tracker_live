@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_core/firebase_core.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../../core/auth/auth_service.dart';
 import '../../../core/theme/admin_theme.dart';
-import '../../../main.dart' show firebaseOptions;
 import '../widgets/admin_sidebar.dart';
 import 'sections/cleanup_section.dart';
 import 'sections/placeholder_sections.dart';
@@ -17,28 +16,11 @@ class AdminShellPage extends StatefulWidget {
 
 class _AdminShellPageState extends State<AdminShellPage> {
   late String _activeSection;
-  Stream<User?>? _authStream;
 
   @override
   void initState() {
     super.initState();
     _activeSection = widget.initialSection;
-    _initAuth();
-  }
-
-  Future<void> _initAuth() async {
-    try {
-      // Firebase déjà initialisé si on arrive via /admin au démarrage
-      _authStream = FirebaseAuth.instance.authStateChanges();
-    } catch (_) {
-      // Cas où on navigue vers /admin depuis / sans recharger la page
-      // Firebase n'est pas encore initialisé — on l'init maintenant
-      try {
-        await Firebase.initializeApp(options: firebaseOptions);
-      } catch (_) {} // déjà initialisé
-      _authStream = FirebaseAuth.instance.authStateChanges();
-    }
-    if (mounted) setState(() {});
   }
 
   Widget _buildContent() => switch (_activeSection) {
@@ -51,25 +33,20 @@ class _AdminShellPageState extends State<AdminShellPage> {
 
   @override
   Widget build(BuildContext context) {
-    if (_authStream == null) {
-      return const Scaffold(backgroundColor: AdminColors.bg, body: Center(child: CircularProgressIndicator(color: AdminColors.accent)));
-    }
-
-    return StreamBuilder<User?>(
-      stream: _authStream,
+    // La session Supabase est déjà résolue après Supabase.initialize() dans
+    // main() (le magic link est capté au chargement). Le stream ne sert qu'à
+    // rebuild sur connexion/déconnexion.
+    return StreamBuilder<AuthState>(
+      stream: AuthService.authStateChanges,
       builder: (context, snapshot) {
-        // En attente état Firebase
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const Scaffold(backgroundColor: AdminColors.bg, body: Center(child: CircularProgressIndicator(color: AdminColors.accent)));
-        }
-        // Non connecté → login
-        if (snapshot.data == null) {
+        // Non connecté (ou email non autorisé) → page de login.
+        if (!AuthService.isAuthenticated || !AuthService.isAuthorized) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) context.go('/admin/login');
           });
           return const Scaffold(backgroundColor: AdminColors.bg);
         }
-        // Connecté → interface
+        // Connecté & autorisé → interface
         final isNarrow = MediaQuery.of(context).size.width < 768;
         if (isNarrow) {
           return Scaffold(
