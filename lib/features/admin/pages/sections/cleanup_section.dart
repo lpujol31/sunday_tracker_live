@@ -734,6 +734,10 @@ class _CleanupSectionState extends State<CleanupSection> {
         const SizedBox(height: 24),
         const _IdentitiesPurgePanel(),
 
+        // Sessions sans propriétaire (user_id NULL) — non couvertes ailleurs
+        const SizedBox(height: 16),
+        const _NullSessionsPanel(),
+
         const SizedBox(height: 40),
         const Center(child: Icon(Icons.keyboard_arrow_down, color: AdminColors.border, size: 28)),
       ]),
@@ -1201,6 +1205,183 @@ class _IdentitiesPurgePanelState extends State<_IdentitiesPurgePanel> {
         if (_loaded && _identities.isEmpty) ...[
           const SizedBox(height: 12),
           const Text('Aucun ride en base.', style: TextStyle(color: AdminColors.textSecondary, fontSize: 13)),
+        ],
+      ]),
+    );
+  }
+}
+
+// ── Sessions sans propriétaire ───────────────────────────────────────────────
+// Anciennes sessions terminées dont `user_id` est NULL (créées avant que l'app
+// mobile ne renseigne l'identité sur les sessions). Elles échappent à la purge
+// par identité (pas de user_id à matcher) ET à la détection de fantômes (elles
+// sont `finished`). Ce panneau les supprime + leurs positions GPS.
+
+class _NullSessionsPanel extends StatefulWidget {
+  const _NullSessionsPanel();
+  @override
+  State<_NullSessionsPanel> createState() => _NullSessionsPanelState();
+}
+
+class _NullSessionsPanelState extends State<_NullSessionsPanel> {
+  bool _loading = false;
+  bool _loaded = false;
+  bool _purging = false;
+  String? _error;
+  int _sessionCount = 0;
+  int _positionCount = 0;
+  List<String> _sessionIds = [];
+
+  Future<void> _load() async {
+    setState(() { _loading = true; _error = null; });
+    try {
+      final supabase = Supabase.instance.client;
+      final sessions = await supabase.from('safety_sessions').select('id').isFilter('user_id', null);
+      final ids = (sessions as List).map((s) => s['id'] as String).toList();
+      var posCount = 0;
+      if (ids.isNotEmpty) {
+        final res = await supabase
+            .from('safety_positions')
+            .select('id')
+            .inFilter('session_id', ids)
+            .count(CountOption.exact);
+        posCount = res.count;
+      }
+      setState(() {
+        _sessionIds = ids;
+        _sessionCount = ids.length;
+        _positionCount = posCount;
+        _loaded = true;
+      });
+    } catch (e) {
+      setState(() => _error = 'Erreur de chargement : $e');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _purge() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: AdminColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: AdminColors.border)),
+        title: const Row(children: [
+          Icon(Icons.warning_amber, color: AdminColors.danger, size: 20),
+          SizedBox(width: 10),
+          Expanded(child: Text('Supprimer ces sessions ?', style: TextStyle(color: AdminColors.textPrimary, fontSize: 16))),
+        ]),
+        content: Text(
+          '$_sessionCount session(s) sans propriétaire et leurs $_positionCount position(s) GPS '
+          'seront supprimées DÉFINITIVEMENT.',
+          style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false),
+              child: const Text('Annuler', style: TextStyle(color: AdminColors.textSecondary))),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AdminColors.danger, foregroundColor: Colors.white),
+            child: const Text('Supprimer'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    setState(() { _purging = true; _error = null; });
+    try {
+      final supabase = Supabase.instance.client;
+      // 1. Positions rattachées (contrainte FK) — par lots pour éviter une
+      //    liste d'IDs trop longue dans le filtre.
+      if (_sessionIds.isNotEmpty) {
+        const chunk = 100;
+        for (var i = 0; i < _sessionIds.length; i += chunk) {
+          final end = (i + chunk < _sessionIds.length) ? i + chunk : _sessionIds.length;
+          await supabase.from('safety_positions').delete().inFilter('session_id', _sessionIds.sublist(i, end));
+        }
+      }
+      // 2. Sessions à user_id NULL.
+      final deleted = await supabase.from('safety_sessions').delete().isFilter('user_id', null).select('id');
+      final n = (deleted as List).length;
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('$n session(s) sans propriétaire supprimée(s) ✓'),
+          backgroundColor: AdminColors.accent, behavior: SnackBarBehavior.floating,
+        ));
+      }
+      await _load();
+    } catch (e) {
+      setState(() => _error = 'Erreur lors de la purge : $e');
+    } finally {
+      if (mounted) setState(() => _purging = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(color: AdminColors.surface, borderRadius: BorderRadius.circular(10), border: Border.all(color: AdminColors.border)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.link_off, color: AdminColors.textSecondary, size: 15),
+          const SizedBox(width: 8),
+          const Text('Sessions sans propriétaire', style: TextStyle(color: AdminColors.textPrimary, fontSize: 15, fontWeight: FontWeight.w700)),
+          const Spacer(),
+          TextButton.icon(
+            onPressed: _loading ? null : _load,
+            icon: _loading
+                ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 2, color: AdminColors.accent))
+                : const Icon(Icons.refresh, size: 14, color: AdminColors.textSecondary),
+            label: Text(_loaded ? 'Recharger' : 'Analyser', style: const TextStyle(color: AdminColors.textSecondary, fontSize: 12)),
+          ),
+        ]),
+        const SizedBox(height: 4),
+        const Text(
+          'Anciennes sessions terminées à `user_id` NULL (d\'avant le suivi d\'identité). '
+          'Ni la purge par identité ni la détection de fantômes ne les couvrent.',
+          style: TextStyle(color: AdminColors.textSecondary, fontSize: 12, height: 1.5),
+        ),
+
+        if (_error != null) ...[
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(color: AdminColors.dangerDim, borderRadius: BorderRadius.circular(8), border: Border.all(color: AdminColors.danger, width: 0.5)),
+            child: Row(children: [
+              const Icon(Icons.error_outline, color: AdminColors.danger, size: 16),
+              const SizedBox(width: 8),
+              Expanded(child: Text(_error!, style: const TextStyle(color: AdminColors.danger, fontSize: 13))),
+            ]),
+          ),
+        ],
+
+        if (_loaded) ...[
+          const SizedBox(height: 14),
+          Row(children: [
+            Expanded(child: Text(
+              _sessionCount == 0
+                  ? 'Aucune session sans propriétaire — rien à nettoyer ✓'
+                  : '$_sessionCount session(s) · $_positionCount position(s) GPS',
+              style: TextStyle(color: _sessionCount == 0 ? AdminColors.accent : AdminColors.textPrimary, fontSize: 13),
+            )),
+            const SizedBox(width: 10),
+            if (_sessionCount > 0)
+              ElevatedButton.icon(
+                onPressed: _purging ? null : _purge,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AdminColors.danger, foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                icon: _purging
+                    ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.delete_outline, size: 16),
+                label: const Text('Purger', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+              ),
+          ]),
         ],
       ]),
     );
