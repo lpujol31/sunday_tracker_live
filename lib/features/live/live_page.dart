@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 // ignore: avoid_web_libraries_in_flutter
 import 'dart:html' as html;
 
@@ -102,6 +103,10 @@ class _LivePageState extends State<LivePage> {
   List<Map<String, dynamic>> _checkpoints = [];
   bool _waypointsPanelOpen = false;
   bool _versionExpanded = false;
+  bool _mobilePanelExpanded = false;
+
+  final GlobalKey _refreshBtnKey = GlobalKey();
+  OverlayEntry? _refreshMenuEntry;
 
   @override
   void initState() {
@@ -118,6 +123,8 @@ class _LivePageState extends State<LivePage> {
   void dispose() {
     refreshTimer?.cancel();
     _tickerTimer?.cancel();
+    _refreshMenuEntry?.remove();
+    _refreshMenuEntry = null;
     super.dispose();
   }
 
@@ -289,9 +296,9 @@ class _LivePageState extends State<LivePage> {
                       child: Row(mainAxisSize: MainAxisSize.min, children: [
                         _forcingUpdate
                             ? const SizedBox(width: 11, height: 11, child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFFF8A00)))
-                            : const Icon(Icons.system_update_alt, size: 12, color: Color(0xFFFF8A00)),
+                            : const Icon(Icons.refresh, size: 13, color: Color(0xFFFF8A00)),
                         const SizedBox(width: 5),
-                        Text(_forcingUpdate ? 'Mise à jour…' : 'Forcer la mise à jour',
+                        Text(_forcingUpdate ? 'Actualisation…' : 'Forcer l\'actualisation de la page',
                             style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w600)),
                       ]),
                     ),
@@ -368,23 +375,64 @@ class _LivePageState extends State<LivePage> {
     return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
   }
 
-  void _fitBounds(List<LatLng> points) {
-    if (points.isEmpty) return;
+  /// Ajuste la caméra aux points. Renvoie true si un vrai fit a eu lieu
+  /// (zoom fini), false si on a dû retomber sur un recentrage de secours.
+  bool _fitBounds(List<LatLng> points) {
+    if (points.isEmpty) return false;
+    // Bornes dégénérées (tous les points au même endroit) → CameraFit renvoie
+    // un zoom infini (« Unsupported operation: Infinity »). On recentre à la
+    // place sur ce point unique.
+    final lats = points.map((p) => p.latitude);
+    final lngs = points.map((p) => p.longitude);
+    final spanLat = lats.reduce(math.max) - lats.reduce(math.min);
+    final spanLng = lngs.reduce(math.max) - lngs.reduce(math.min);
+    if (spanLat < 1e-6 && spanLng < 1e-6) {
+      _safeMove(points.first, 15);
+      return true; // positionné correctement, inutile de réessayer
+    }
     final bounds = LatLngBounds.fromPoints(points);
-    mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)));
+    try {
+      mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)));
+      // Si le fit s'est produit avant que la carte ait une taille valide, le
+      // zoom résultant peut être infini/NaN et fait planter la TileLayer au
+      // rendu. On corrige alors par un recentrage à zoom fixe.
+      final z = mapController.camera.zoom;
+      if (!z.isFinite) {
+        _safeMove(points.first, 15);
+        return false;
+      }
+      return true;
+    } catch (_) {
+      _safeMove(points.first, 15);
+      return false;
+    }
+  }
+
+  void _safeMove(LatLng center, double zoom) {
+    try {
+      mapController.move(center, zoom);
+    } catch (_) {}
   }
 
   void _tryInitialFit() {
     if (!_mapReady || _mapFitDone) return;
     final points = tracePoints;
     if (points.isEmpty) return;
-    _fitBounds(points);
-    _mapFitDone = true;
+    if (_fitBounds(points)) {
+      _mapFitDone = true;
+    } else {
+      // Carte pas encore dimensionnée (timing web) : on réessaie au frame suivant.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _tryInitialFit();
+      });
+    }
   }
 
   void _recenter() {
     if (latitude == null || longitude == null) return;
-    mapController.move(LatLng(latitude!, longitude!), 15);
+    try {
+      mapController.move(LatLng(latitude!, longitude!), 15);
+    } catch (_) {}
   }
 
   void _updateDocumentMeta(String status) {
@@ -462,7 +510,10 @@ class _LivePageState extends State<LivePage> {
               .map((w) => {
                     'created_at': w['timestamp'] as String?,
                     'comment': (w['note'] as String? ?? '').isNotEmpty ? w['note'] : null,
-                    'photo_url': null, // chemins locaux téléphone — inaccessibles depuis le web
+                    // Photos uploadées sur le bucket public `waypoint-photos` : on ne
+                    // garde que les URL distantes (les chemins 'local' pointent vers
+                    // le téléphone et sont inaccessibles depuis le web).
+                    'photo_urls': _waypointPhotoUrls(w['photos']),
                     'lat': w['lat'],
                     'lng': w['lng'],
                   })
@@ -505,7 +556,12 @@ class _LivePageState extends State<LivePage> {
         if (!_mapFitDone) {
           _tryInitialFit();
         } else {
-          mapController.move(LatLng(latitude!, longitude!), mapController.camera.zoom);
+          double z = 15;
+          try {
+            final current = mapController.camera.zoom;
+            if (current.isFinite) z = current;
+          } catch (_) {}
+          _safeMove(LatLng(latitude!, longitude!), z);
         }
       });
       if (manual) {
@@ -516,43 +572,105 @@ class _LivePageState extends State<LivePage> {
     }
   }
 
-  void _showRefreshBottomSheet(BuildContext context) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF1B1B1B),
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (_) => SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('Rafraîchissement', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                onPressed: isRefreshing ? null : () { Navigator.pop(context); loadLastPosition(manual: true); },
-                style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2A2A2A), foregroundColor: Colors.white),
-                icon: const Icon(Icons.refresh, color: Colors.orange),
-                label: const Text('Rafraîchir maintenant'),
-              ),
-            ),
-            const SizedBox(height: 12),
-            const Text('Intervalle auto', style: TextStyle(color: Colors.white54, fontSize: 13)),
-            const SizedBox(height: 8),
-            Wrap(spacing: 8, children: [
-              for (final entry in {0: 'Off', 15: '15 s', 30: '30 s', 60: '60 s'}.entries)
-                ChoiceChip(
-                  label: Text(entry.value),
-                  selected: refreshIntervalSeconds == entry.key,
-                  selectedColor: Colors.orange,
-                  labelStyle: TextStyle(color: refreshIntervalSeconds == entry.key ? Colors.black : Colors.white70),
-                  backgroundColor: const Color(0xFF2A2A2A),
-                  onSelected: (_) { Navigator.pop(context); changeRefreshInterval(entry.key); },
-                ),
-            ]),
-          ]),
+  /// Menu contextuel de rafraîchissement, ancré à gauche du bouton sync.
+  void _toggleRefreshMenu() {
+    if (_refreshMenuEntry != null) {
+      _removeRefreshMenu();
+      return;
+    }
+    final overlay = Overlay.of(context);
+    final btnCtx = _refreshBtnKey.currentContext;
+    if (btnCtx == null) return;
+    final btnBox = btnCtx.findRenderObject() as RenderBox?;
+    final overlayBox = overlay.context.findRenderObject() as RenderBox?;
+    if (btnBox == null || overlayBox == null) return;
+    final btnPos = btnBox.localToGlobal(Offset.zero, ancestor: overlayBox);
+    final overlaySize = overlayBox.size;
+    const menuWidth = 240.0;
+    // Aligné à droite du menu = bord gauche du bouton, avec 8px d'écart.
+    final rightInset = overlaySize.width - btnPos.dx + 8;
+
+    _refreshMenuEntry = OverlayEntry(
+      builder: (_) => Stack(children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _removeRefreshMenu,
+            child: const SizedBox.expand(),
+          ),
         ),
+        Positioned(
+          right: rightInset,
+          top: btnPos.dy,
+          width: menuWidth,
+          child: TweenAnimationBuilder<double>(
+            duration: const Duration(milliseconds: 130),
+            curve: Curves.easeOut,
+            tween: Tween(begin: 0, end: 1),
+            builder: (_, t, child) => Opacity(
+              opacity: t,
+              child: Transform.scale(alignment: Alignment.centerRight, scale: 0.96 + 0.04 * t, child: child),
+            ),
+            child: _buildRefreshMenuCard(),
+          ),
+        ),
+      ]),
+    );
+    overlay.insert(_refreshMenuEntry!);
+  }
+
+  void _removeRefreshMenu() {
+    _refreshMenuEntry?.remove();
+    _refreshMenuEntry = null;
+  }
+
+  Widget _buildRefreshMenuCard() {
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1B1B1B),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white12),
+          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 20, offset: const Offset(0, 8))],
+        ),
+        padding: const EdgeInsets.all(12),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Rafraîchissement', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: isRefreshing ? null : () { _removeRefreshMenu(); loadLastPosition(manual: true); },
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              decoration: BoxDecoration(color: const Color(0xFF2A2A2A), borderRadius: BorderRadius.circular(10)),
+              child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(Icons.refresh, color: Colors.orange, size: 18),
+                SizedBox(width: 8),
+                Text('Rafraîchir maintenant', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+              ]),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text('Intervalle auto', style: TextStyle(color: Colors.white54, fontSize: 12)),
+          const SizedBox(height: 8),
+          Wrap(spacing: 8, runSpacing: 8, children: [
+            for (final entry in {0: 'Off', 15: '15 s', 30: '30 s', 60: '60 s'}.entries)
+              GestureDetector(
+                onTap: () { _removeRefreshMenu(); changeRefreshInterval(entry.key); },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: refreshIntervalSeconds == entry.key ? Colors.orange : const Color(0xFF2A2A2A),
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(entry.value, style: TextStyle(
+                    color: refreshIntervalSeconds == entry.key ? Colors.black : Colors.white70,
+                    fontSize: 12, fontWeight: FontWeight.w600)),
+                ),
+              ),
+          ]),
+        ]),
       ),
     );
   }
@@ -623,6 +741,28 @@ class _LivePageState extends State<LivePage> {
     }
   }
 
+  /// Change le fond de carte en préservant la position/zoom courants.
+  /// La carte est recréée (nouveau MapController) car flutter_map ne permet
+  /// pas de changer le maxZoom à chaud.
+  void _changeMapStyle(int i) {
+    if (i == _mapStyleIndex) return;
+    final newMaxZoom = (kMapStyles[i]['maxZoom'] as int).toDouble();
+    double currentZoom = _savedZoom;
+    LatLng? currentCenter = _savedCenter;
+    try {
+      final z = mapController.camera.zoom;
+      if (z.isFinite) currentZoom = z;
+      currentCenter = mapController.camera.center;
+    } catch (_) {}
+    setState(() {
+      _mapStyleIndex = i;
+      _savedZoom = currentZoom > newMaxZoom ? newMaxZoom : currentZoom;
+      _savedCenter = currentCenter;
+      mapController = MapController();
+      _mapReady = false;
+    });
+  }
+
   Widget _buildMapStyleSelector() {
     return Container(
       decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.65), borderRadius: BorderRadius.circular(20)),
@@ -634,20 +774,7 @@ class _LivePageState extends State<LivePage> {
 
           final isActive = i == _mapStyleIndex;
           return GestureDetector(
-            onTap: () {
-                if (i == _mapStyleIndex) return;
-                final newMaxZoom = (kMapStyles[i]['maxZoom'] as int).toDouble();
-                // Sauvegarder position courante avant de recréer la carte
-                final currentZoom = mapController.camera.zoom;
-                final currentCenter = mapController.camera.center;
-                setState(() {
-                  _mapStyleIndex = i;
-                  _savedZoom = currentZoom > newMaxZoom ? newMaxZoom : currentZoom;
-                  _savedCenter = currentCenter;
-                  mapController = MapController();
-                  _mapReady = false;
-                });
-              },
+            onTap: () => _changeMapStyle(i),
             child: AnimatedContainer(
               duration: const Duration(milliseconds: 200),
               margin: const EdgeInsets.symmetric(horizontal: 2),
@@ -694,6 +821,19 @@ class _LivePageState extends State<LivePage> {
                   child: const Icon(Icons.play_arrow, color: Colors.white, size: 16),
                 ),
               ),
+            if (points.length > 1)
+              Marker(
+                point: points.last, width: 26, height: 26,
+                child: Container(
+                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF6D28D9).withValues(alpha: 0.6), blurRadius: 8)]),
+                  child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
+                ),
+              ),
+            Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
+            // Waypoints dessinés en DERNIER = toujours au-dessus des markers
+            // structurels (départ / arrivée / position courante). Sinon un WP
+            // proche de l'arrivée (cas fréquent : point marqué en fin de sortie)
+            // est masqué par le gros pin d'arrivée et semble absent du tracé.
             for (final cp in _checkpoints)
               if (cp['lat'] != null && cp['lng'] != null)
                 Marker(
@@ -704,15 +844,6 @@ class _LivePageState extends State<LivePage> {
                     child: const Icon(Icons.location_on, color: Colors.white, size: 16),
                   ),
                 ),
-            if (points.length > 1)
-              Marker(
-                point: points.last, width: 26, height: 26,
-                child: Container(
-                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF6D28D9).withValues(alpha: 0.6), blurRadius: 8)]),
-                  child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
-                ),
-              ),
-            Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
           ]),
         ],
     );
@@ -768,17 +899,8 @@ class _LivePageState extends State<LivePage> {
             )),
             const SizedBox(width: 8),
           ],
-          if (isMobile && !_isFinished) ...[
-            if (isRefreshing)
-              const Padding(
-                padding: EdgeInsets.only(right: 4, top: 4),
-                child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)),
-              ),
-            GestureDetector(
-              onTap: () => _showRefreshBottomSheet(context),
-              child: const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.more_vert, color: Colors.orange, size: 22)),
-            ),
-          ],
+          // Le rafraîchissement mobile est désormais géré par le bouton sync
+          // du groupe de contrôles carte (plus de doublon ⋮ ici).
         ],
       ),
     );
@@ -787,16 +909,16 @@ class _LivePageState extends State<LivePage> {
   String _formatUpdateDateFr() {
     if (lastUpdate == null) return '';
     final dt = lastUpdate!.toLocal();
-    const months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin',
-                    'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
+                    'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
     return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
   }
 
   String _formatStartDateFr() {
     if (rideStartTime == null) return '--';
     final dt = rideStartTime!.toLocal();
-    const months = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin',
-                    'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+    const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
+                    'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
     return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
   }
 
@@ -851,7 +973,7 @@ class _LivePageState extends State<LivePage> {
             const SizedBox(height: 6),
           ],
           Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-            const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 20),
+            const Icon(Icons.location_on, color: Colors.red, size: 20),
             const SizedBox(width: 8),
             Text(_formatSinceLastUpdate(),
               style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
@@ -992,179 +1114,216 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
+  /// Groupe de contrôles carte flottant (mobile) — même look que l'app mobile
+  /// (ride en cours / détail du ride) : un seul bloc sombre flouté, boutons
+  /// collés. Le dernier bouton cycle entre les fonds de carte (Plan → Satellite
+  /// → Topo) en affichant l'icône du style courant.
+  Widget _buildMobileMapControls() {
+    Widget btn({Key? key, required Widget child, required VoidCallback onTap}) {
+      return GestureDetector(
+        onTap: onTap,
+        child: SizedBox(key: key, width: 46, height: 46, child: Center(child: child)),
+      );
+    }
+
+    Widget separator() => Container(height: 1, color: Colors.white.withValues(alpha: 0.09));
+
+    final buttons = <Widget>[];
+    if (!_isFinished) {
+      buttons.add(btn(
+        key: _refreshBtnKey,
+        onTap: _toggleRefreshMenu,
+        child: isRefreshing
+            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange))
+            : const Icon(Icons.sync, color: Colors.white, size: 22),
+      ));
+      buttons.add(separator());
+    }
+    buttons.add(btn(
+      onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
+      child: const Icon(Icons.fit_screen, color: Colors.white, size: 22),
+    ));
+    buttons.add(separator());
+    buttons.add(btn(onTap: _recenter, child: const Icon(Icons.my_location, color: Colors.white, size: 22)));
+    buttons.add(separator());
+    // Cycle de fond de carte — icône du style courant
+    buttons.add(btn(
+      onTap: () => _changeMapStyle((_mapStyleIndex + 1) % kMapStyles.length),
+      child: Icon(kMapStyles[_mapStyleIndex]['icon'] as IconData, color: Colors.white, size: 22),
+    ));
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(16),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+        child: Container(
+          width: 46,
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.70),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.09)),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: buttons),
+        ),
+      ),
+    );
+  }
+
   Widget _buildMobileBottomPanel(double bottomPadding) {
+    final expanded = _mobilePanelExpanded;
     return Padding(
       padding: EdgeInsets.fromLTRB(14, 0, 14, 12 + bottomPadding),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 10, 14, 12),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1B1B1B),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // Waypoints trigger
-            GestureDetector(
-              onTap: () => _showWaypointsBottomSheet(context),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.05),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.white12),
+      child: AnimatedSize(
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeInOut,
+        alignment: Alignment.bottomCenter,
+        child: Container(
+          padding: const EdgeInsets.fromLTRB(14, 4, 14, 12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1B1B1B),
+            borderRadius: BorderRadius.circular(16),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Poignée de drag : tap ou glisser vertical pour agrandir/réduire
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => setState(() => _mobilePanelExpanded = !expanded),
+                onVerticalDragEnd: (details) {
+                  final v = details.primaryVelocity ?? 0;
+                  if (v < -80) {
+                    setState(() => _mobilePanelExpanded = true);
+                  } else if (v > 80) {
+                    setState(() => _mobilePanelExpanded = false);
+                  }
+                },
+                child: Container(
+                  width: double.infinity,
+                  alignment: Alignment.center,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Container(
+                    width: 40, height: 4,
+                    decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999)),
+                  ),
                 ),
-                child: Row(children: [
-                  const Icon(Icons.route, color: Color(0xFF4F9CFF), size: 14),
-                  const SizedBox(width: 8),
-                  const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
-                  const SizedBox(width: 4),
-                  Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 12)),
-                  const Spacer(),
-                  const Icon(Icons.keyboard_arrow_up, color: Colors.white38, size: 18),
-                ]),
               ),
-            ),
-            const SizedBox(height: 8),
-            // Controls row
-            Row(
-              children: [
-                _buildMapStyleSelector(),
+              // En-tête position (toujours visible)
+              Row(children: [
+                const Text('DERNIÈRE POSITION CONNUE',
+                  style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
                 const Spacer(),
-                if (!_isFinished) ...[
-                  GestureDetector(
-                    onTap: () => _showRefreshBottomSheet(context),
+                if (rideStatus == 'in_progress' || rideStatus == 'paused')
+                  _buildSignalIndicator()
+                else if (_isFinished)
+                  _buildStatusPill(),
+              ]),
+              if (!_isFinished) ...[
+                const SizedBox(height: 4),
+                _buildStatusPill(),
+              ],
+              const SizedBox(height: 4),
+              // Position (toujours visible)
+              Row(children: [
+                const Icon(Icons.location_on, color: Colors.red, size: 18),
+                const SizedBox(width: 6),
+                Text(_formatSinceLastUpdate(),
+                  style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              ]),
+              // Date/heure de la dernière position (toujours visible)
+              if (lastUpdate != null) ...[
+                const SizedBox(height: 6),
+                Row(children: [
+                  const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
+                  const SizedBox(width: 5),
+                  Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
+                  const SizedBox(width: 10),
+                  const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
+                  const SizedBox(width: 5),
+                  Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
+                    style: const TextStyle(color: Colors.white60, fontSize: 11)),
+                ]),
+              ],
+              const SizedBox(height: 12),
+              // Boutons (clôturent le bloc « dernière position », toujours visibles)
+              Row(children: [
+                Expanded(
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: () => _showNavigationSheet(context),
                     child: Container(
-                      width: 36, height: 36,
-                      decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
-                      child: isRefreshing
-                          ? const Center(child: SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)))
-                          : const Icon(Icons.sync, color: Colors.white, size: 18),
+                      padding: const EdgeInsets.symmetric(vertical: 10),
+                      decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
+                      child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                        Icon(Icons.map_outlined, color: Colors.white, size: 15),
+                        SizedBox(width: 6),
+                        Text('Ouvrir la position', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                      ]),
                     ),
                   ),
-                  const SizedBox(width: 6),
-                ],
+                ),
+                const SizedBox(width: 8),
                 GestureDetector(
-                  onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _copyShareLink,
                   child: Container(
-                    width: 36, height: 36,
-                    decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
-                    child: const Icon(Icons.fit_screen, color: Colors.white, size: 18),
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF232323),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: const Icon(Icons.link, color: Colors.white38, size: 18),
                   ),
                 ),
-                const SizedBox(width: 6),
-                GestureDetector(
-                  onTap: _recenter,
-                  child: Container(
-                    width: 36, height: 36,
-                    decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
-                    child: const Icon(Icons.my_location, color: Colors.white, size: 18),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            // Stats row (sans séparateur au-dessus)
-            Row(
-              children: [
-                Expanded(child: _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters))),
-                Container(width: 1, height: 36, color: Colors.white12),
-                Expanded(child: Padding(
-                  padding: const EdgeInsets.only(left: 14),
-                  child: _buildStatBlock('Durée', _formatDuration(_rideDuration)),
-                )),
-                Container(width: 1, height: 36, color: Colors.white12),
-                Expanded(child: Padding(
-                  padding: const EdgeInsets.only(left: 14),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
+              ]),
+              // Détails supplémentaires (dépliés)
+              if (expanded) ...[
+                const SizedBox(height: 12),
+                Container(height: 1, color: Colors.white12),
+                const SizedBox(height: 12),
+                // Stats — Distance | Durée
+                IntrinsicHeight(
+                  child: Row(
                     children: [
-                      const Text('Départ', style: TextStyle(color: Colors.white54, fontSize: 11)),
-                      const SizedBox(height: 2),
-                      Text(
-                        rideStartTime != null ? '${_formatStartDateFr()} • ${_formatStartTime()}' : '--',
-                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                      Expanded(child: _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters))),
+                      Container(width: 1, color: Colors.white12),
+                      Expanded(child: Padding(
+                        padding: const EdgeInsets.only(left: 14),
+                        child: _buildStatBlock('Durée', _formatDuration(_rideDuration)),
+                      )),
                     ],
                   ),
-                )),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Container(height: 1, color: Colors.white12),
-            const SizedBox(height: 8),
-            // Position header
-            Row(children: [
-              const Text('DERNIÈRE POSITION CONNUE',
-                style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
-              const Spacer(),
-              if (rideStatus == 'in_progress' || rideStatus == 'paused')
-                _buildSignalIndicator()
-              else if (_isFinished)
-                _buildStatusPill(),
-            ]),
-            if (!_isFinished) ...[
-              const SizedBox(height: 4),
-              _buildStatusPill(),
-            ],
-            const SizedBox(height: 4),
-            // Position
-            Row(children: [
-              const Icon(Icons.location_on, color: Color(0xFFFF8A00), size: 18),
-              const SizedBox(width: 6),
-              Text(_formatSinceLastUpdate(),
-                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-            ]),
-            if (lastUpdate != null) ...[
-              const SizedBox(height: 4),
-              Row(children: [
-                const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
-                const SizedBox(width: 5),
-                Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
-                const SizedBox(width: 10),
-                const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
-                const SizedBox(width: 5),
-                Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
-                  style: const TextStyle(color: Colors.white60, fontSize: 11)),
-              ]),
-            ],
-            const SizedBox(height: 8),
-            // Boutons
-            Row(children: [
-              Expanded(
-                child: GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: () => _showNavigationSheet(context),
+                ),
+                const SizedBox(height: 10),
+                // Départ — pleine largeur (plus de troncature)
+                _buildDepartBlock(),
+                const SizedBox(height: 12),
+                // Points de passage
+                GestureDetector(
+                  onTap: () => _showWaypointsBottomSheet(context),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
-                    child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      Icon(Icons.map_outlined, color: Colors.white, size: 15),
-                      SizedBox(width: 6),
-                      Text('Ouvrir la position', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.05),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.route, color: Color(0xFF4F9CFF), size: 14),
+                      const SizedBox(width: 8),
+                      const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
+                      const SizedBox(width: 4),
+                      Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 12)),
+                      const Spacer(),
+                      const Icon(Icons.chevron_right, color: Colors.white38, size: 18),
                     ]),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _copyShareLink,
-                child: Container(
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF232323),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.white12),
-                  ),
-                  child: const Icon(Icons.link, color: Colors.white38, size: 18),
-                ),
-              ),
-            ]),
-          ],
+              ],
+            ],
+          ),
         ),
       ),
     );
@@ -1263,8 +1422,8 @@ class _LivePageState extends State<LivePage> {
           style: TextButton.styleFrom(foregroundColor: Colors.white54, padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10)),
           icon: _forcingUpdate
               ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white54))
-              : const Icon(Icons.system_update_alt, size: 16),
-          label: Text(_forcingUpdate ? 'Mise à jour…' : 'Forcer la mise à jour de l\'app'),
+              : const Icon(Icons.refresh, size: 18),
+          label: Text(_forcingUpdate ? 'Actualisation…' : 'Forcer l\'actualisation de la page'),
         ),
         const Text('À utiliser si l\'app semble bloquée sur une ancienne version', style: TextStyle(color: Colors.white30, fontSize: 11), textAlign: TextAlign.center),
       ]))),
@@ -1290,12 +1449,101 @@ class _LivePageState extends State<LivePage> {
     return n;
   }
 
+  /// Extrait les URL publiques Supabase des photos d'un waypoint.
+  /// Format mobile : `List<{'local': <chemin téléphone>, 'url': <http public>}>`.
+  /// On ignore 'local' (inaccessible depuis le web) et les entrées legacy String
+  /// (ancien format = simple chemin local, jamais uploadé).
+  List<String> _waypointPhotoUrls(dynamic photos) {
+    if (photos is! List) return const [];
+    final urls = <String>[];
+    for (final p in photos) {
+      if (p is Map) {
+        final u = p['url'];
+        if (u is String && u.isNotEmpty) urls.add(u);
+      }
+    }
+    return urls;
+  }
+
+  /// Visionneuse plein écran d'une galerie de photos (swipe entre les photos +
+  /// pinch-to-zoom). Ouverte au tap sur une vignette de waypoint.
+  void _openPhotoGallery(List<String> urls, int initialIndex) {
+    final controller = PageController(initialPage: initialIndex);
+    final pageNotifier = ValueNotifier<int>(initialIndex);
+    showDialog<void>(
+      context: context,
+      barrierColor: Colors.black.withValues(alpha: 0.94),
+      builder: (dialogCtx) => Stack(
+        children: [
+          PageView.builder(
+            controller: controller,
+            itemCount: urls.length,
+            onPageChanged: (i) => pageNotifier.value = i,
+            itemBuilder: (_, i) => InteractiveViewer(
+              minScale: 0.8,
+              maxScale: 4,
+              child: Center(
+                child: Image.network(
+                  urls[i],
+                  fit: BoxFit.contain,
+                  loadingBuilder: (ctx, child, progress) => progress == null
+                      ? child
+                      : const Center(child: CircularProgressIndicator(color: Colors.white38)),
+                  errorBuilder: (ctx, error, stack) => const Center(
+                    child: Icon(Icons.broken_image, color: Colors.white24, size: 48),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          SafeArea(
+            child: Align(
+              alignment: Alignment.topRight,
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: GestureDetector(
+                  onTap: () => Navigator.of(dialogCtx).pop(),
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.6), shape: BoxShape.circle),
+                    child: const Icon(Icons.close, color: Colors.white, size: 22),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (urls.length > 1)
+            SafeArea(
+              child: Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 20),
+                  child: ValueListenableBuilder<int>(
+                    valueListenable: pageNotifier,
+                    builder: (_, page, _) => Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.6), borderRadius: BorderRadius.circular(999)),
+                      child: Text('${page + 1} / ${urls.length}',
+                          style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    ).then((_) {
+      controller.dispose();
+      pageNotifier.dispose();
+    });
+  }
+
   Widget _buildTimelinePoint({
     required String type,
     required String label,
     DateTime? time,
     String? comment,
-    String? photoUrl,
+    List<String> photoUrls = const [],
     required bool isLast,
   }) {
     final Color dotColor;
@@ -1363,13 +1611,37 @@ class _LivePageState extends State<LivePage> {
                     const SizedBox(height: 4),
                     Text(comment, style: const TextStyle(color: Colors.white60, fontSize: 12, height: 1.4)),
                   ],
-                  if (photoUrl != null && photoUrl.isNotEmpty) ...[
+                  if (photoUrls.isNotEmpty) ...[
                     const SizedBox(height: 8),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(8),
-                      child: Image.network(
-                        photoUrl, height: 80, width: double.infinity, fit: BoxFit.cover,
-                        errorBuilder: (context, error, stack) => const SizedBox.shrink(),
+                    SizedBox(
+                      height: 80,
+                      child: ListView.separated(
+                        scrollDirection: Axis.horizontal,
+                        itemCount: photoUrls.length,
+                        separatorBuilder: (_, _) => const SizedBox(width: 6),
+                        itemBuilder: (_, i) => GestureDetector(
+                          onTap: () => _openPhotoGallery(photoUrls, i),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(8),
+                            child: Image.network(
+                              photoUrls[i], height: 80, width: 80, fit: BoxFit.cover,
+                              loadingBuilder: (ctx, child, progress) => progress == null
+                                  ? child
+                                  : Container(
+                                      width: 80, height: 80,
+                                      color: const Color(0xFF2A2A2A),
+                                      alignment: Alignment.center,
+                                      child: const SizedBox(width: 16, height: 16,
+                                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38)),
+                                    ),
+                              errorBuilder: (context, error, stack) => Container(
+                                width: 80, height: 80,
+                                color: const Color(0xFF2A2A2A),
+                                child: const Icon(Icons.broken_image, color: Colors.white24, size: 20),
+                              ),
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ],
@@ -1410,7 +1682,7 @@ class _LivePageState extends State<LivePage> {
       widgets.add(_buildTimelinePoint(
         type: 'checkpoint', label: 'Point mémorisé', time: dt,
         comment: cp['comment'] as String?,
-        photoUrl: cp['photo_url'] as String?,
+        photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
         isLast: ++idx == total,
       ));
     }
@@ -1570,7 +1842,21 @@ class _LivePageState extends State<LivePage> {
           Positioned(
             bottom: 0, left: 0, right: 0,
             child: isMobileLayout
-                ? _buildMobileBottomPanel(bottomPadding)
+                ? Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // Contrôles carte flottants, alignés au-dessus du panneau
+                      Padding(
+                        padding: const EdgeInsets.only(right: 14, bottom: 10),
+                        child: Align(
+                          alignment: Alignment.centerRight,
+                          child: _buildMobileMapControls(),
+                        ),
+                      ),
+                      _buildMobileBottomPanel(bottomPadding),
+                    ],
+                  )
                 : _buildDesktopBottomBar(bottomPadding),
           ),
           // Desktop: tab repliable + panel droit
