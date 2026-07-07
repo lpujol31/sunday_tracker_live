@@ -370,9 +370,9 @@ class _LivePageState extends State<LivePage> {
   }
 
   String _formatStartTime() {
-    if (rideStartTime == null) return '--:--';
+    if (rideStartTime == null) return '--:--:--';
     final dt = rideStartTime!.toLocal();
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
   }
 
   /// Ajuste la caméra aux points. Renvoie true si un vrai fit a eu lieu
@@ -825,7 +825,7 @@ class _LivePageState extends State<LivePage> {
   /// par une fine ligne à un point posé sur sa vraie position GPS. La boîte est
   /// centrée sur la coordonnée (alignment center) et assez grande pour contenir
   /// le décalage dans n'importe quelle direction.
-  Marker _waypointMarker(LatLng at) {
+  Marker _waypointMarker(LatLng at, int number) {
     const color = Color(0xFF3B82F6);
     const lead = 30.0; // longueur de la ligne de rappel (px écran)
     const box = 120.0;
@@ -848,11 +848,28 @@ class _LivePageState extends State<LivePage> {
               border: Border.all(color: Colors.white, width: 1.5),
             ),
           ),
-          // Pin flottant, tip à l'extrémité de la ligne.
+          // Pin flottant numéroté, tip à l'extrémité de la ligne.
           Transform.translate(
             offset: Offset(tip.dx, tip.dy - 14),
-            child: const Icon(Icons.location_on, color: color, size: 28,
-                shadows: [Shadow(color: Colors.black45, blurRadius: 4)]),
+            child: SizedBox(
+              width: 28, height: 28,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  const Icon(Icons.location_on, color: color, size: 28,
+                      shadows: [Shadow(color: Colors.black45, blurRadius: 4)]),
+                  // Le centre de la tête ronde du pin est ~4px au-dessus du
+                  // centre géométrique → on remonte le numéro (le Stack le
+                  // garde centré horizontalement).
+                  Transform.translate(
+                    offset: const Offset(0, -4),
+                    child: Text('$number',
+                        style: const TextStyle(color: Colors.white, fontSize: 11,
+                            fontWeight: FontWeight.w700, height: 1)),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),
@@ -906,9 +923,9 @@ class _LivePageState extends State<LivePage> {
             // pin flottant décalé PERPENDICULAIREMENT à la trace, relié par une
             // fine ligne à un point posé sur sa vraie position GPS. Évite toute
             // superposition avec les markers départ/arrivée. Cf _waypointMarker.
-            for (final cp in _checkpoints)
+            for (final (i, cp) in _checkpoints.indexed)
               if (cp['lat'] != null && cp['lng'] != null)
-                _waypointMarker(LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble())),
+                _waypointMarker(LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble()), i + 1),
           ]),
         ],
     );
@@ -1609,6 +1626,7 @@ class _LivePageState extends State<LivePage> {
     DateTime? time,
     String? comment,
     List<String> photoUrls = const [],
+    int? number,
     required bool isLast,
   }) {
     final Color dotColor;
@@ -1628,7 +1646,9 @@ class _LivePageState extends State<LivePage> {
         break;
       default:
         dotColor = const Color(0xFF3B82F6);
-        dotInner = const Icon(Icons.location_on, color: Colors.white, size: 12);
+        dotInner = number != null
+            ? Text('$number', style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, height: 1))
+            : const Icon(Icons.location_on, color: Colors.white, size: 12);
     }
     final timeStr = time != null
         ? '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}'
@@ -1742,12 +1762,13 @@ class _LivePageState extends State<LivePage> {
       isLast: ++idx == total,
     ));
 
-    for (final cp in _checkpoints) {
+    for (final (i, cp) in _checkpoints.indexed) {
       final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
       widgets.add(_buildTimelinePoint(
         type: 'checkpoint', label: 'Point mémorisé', time: dt,
         comment: cp['comment'] as String?,
         photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
+        number: i + 1,
         isLast: ++idx == total,
       ));
     }
