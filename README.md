@@ -5,7 +5,11 @@ et tracé GPS d'un pratiquant outdoor participants à une pratique en outdoor (v
 
 Ce tracé est partagé au départ par le participant 
 
-## Déploiment
+## Déploiment auto
+.\deploy.ps1
+.\deploy.ps1 -NoBump → redéploie sans changer le numéro de version.
+
+## Déploiment manuel
 flutter clean
 flutter pub get
 flutter build web --release
@@ -21,7 +25,7 @@ flutter clean && flutter pub get && flutter build web --release --no-wasm-dry-ru
 ### Github
 https://github.com/lpujol31/sunday_tracker_live
 git add .
-git commit -m "commentaire"
+git commit -m "1.1.0+2026070502"
 git push
 
 ### Firebase

@@ -850,21 +850,23 @@ class _LivePageState extends State<LivePage> {
           ),
           // Pin flottant numéroté, tip à l'extrémité de la ligne.
           Transform.translate(
-            offset: Offset(tip.dx, tip.dy - 14),
+            offset: Offset(tip.dx, tip.dy - 17),
             child: SizedBox(
-              width: 28, height: 28,
+              width: 34, height: 34,
               child: Stack(
                 alignment: Alignment.center,
                 children: [
-                  const Icon(Icons.location_on, color: color, size: 28,
+                  const Icon(Icons.location_on, color: color, size: 34,
                       shadows: [Shadow(color: Colors.black45, blurRadius: 4)]),
-                  // Le centre de la tête ronde du pin est ~4px au-dessus du
+                  // Le centre de la tête ronde du pin est ~5px au-dessus du
                   // centre géométrique → on remonte le numéro (le Stack le
-                  // garde centré horizontalement).
+                  // garde centré horizontalement). Police réduite au-delà de
+                  // 9 pour que les nombres à 2 chiffres tiennent dans la tête.
                   Transform.translate(
-                    offset: const Offset(0, -4),
+                    offset: const Offset(0, -5),
                     child: Text('$number',
-                        style: const TextStyle(color: Colors.white, fontSize: 11,
+                        style: TextStyle(color: Colors.white,
+                            fontSize: number >= 10 ? 10 : 13,
                             fontWeight: FontWeight.w700, height: 1)),
                   ),
                 ],
@@ -1647,7 +1649,7 @@ class _LivePageState extends State<LivePage> {
       default:
         dotColor = const Color(0xFF3B82F6);
         dotInner = number != null
-            ? Text('$number', style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w700, height: 1))
+            ? Text('$number', style: TextStyle(color: Colors.white, fontSize: number >= 10 ? 10 : 11, fontWeight: FontWeight.w700, height: 1))
             : const Icon(Icons.location_on, color: Colors.white, size: 12);
     }
     final timeStr = time != null
