@@ -102,6 +102,11 @@ class _LivePageState extends State<LivePage> {
 
   List<Map<String, dynamic>> _checkpoints = [];
   bool _waypointsPanelOpen = false;
+  // Point de passage mis en évidence dans le volet desktop (tap sur sa pastille
+  // carte). Index dans _checkpoints ; null = aucun. _highlightKey est attachée à
+  // l'item correspondant pour l'y faire défiler automatiquement.
+  int? _highlightedCheckpoint;
+  final GlobalKey _highlightKey = GlobalKey();
   bool _versionExpanded = false;
   bool _mobilePanelExpanded = false;
 
@@ -792,9 +797,10 @@ class _LivePageState extends State<LivePage> {
   }
 
   /// Direction unitaire (repère écran) PERPENDICULAIRE à la trace au niveau du
-  /// waypoint `at`. Permet de décaler le pin sur le côté de la trace plutôt que
-  /// systématiquement vers le haut. Biaisée vers le haut (y < 0) pour un rendu
-  /// naturel ; si la perpendiculaire est ~horizontale, on part vers la droite.
+  /// waypoint `at`. Le pin est décalé sur le côté de la trace, du côté qui pointe
+  /// vers l'EXTÉRIEUR (loin du barycentre) : sur une boucle, le pin sort donc de
+  /// la boucle au lieu de tomber dedans. Repli sur un biais « vers le haut »
+  /// (sinon vers la droite) quand le waypoint est ~au centre du tracé.
   Offset _leaderDirection(LatLng at) {
     final trace = tracePoints;
     if (trace.length < 2) return const Offset(0, -1);
@@ -809,28 +815,45 @@ class _LivePageState extends State<LivePage> {
     final a = trace[math.max(0, nearest - 2)];
     final b = trace[math.min(trace.length - 1, nearest + 2)];
     final latRad = at.latitude * math.pi / 180;
+    final cosLat = math.cos(latRad);
     // Tangente en repère écran (mercator local) : x ∝ Δlng·cos(lat), y ∝ -Δlat.
-    final tx = (b.longitude - a.longitude) * math.cos(latRad);
+    final tx = (b.longitude - a.longitude) * cosLat;
     final ty = -(b.latitude - a.latitude);
     final tlen = math.sqrt(tx * tx + ty * ty);
     if (tlen < 1e-12) return const Offset(0, -1);
     var px = -ty / tlen; // perpendiculaire = tangente tournée de 90°
     var py = tx / tlen;
-    if (py > 1e-6) { px = -px; py = -py; } // oriente vers le haut
-    else if (py.abs() <= 1e-6 && px < 0) { px = -px; } // sinon vers la droite
+    // Barycentre du tracé, puis vecteur « vers l'extérieur » = du barycentre
+    // vers le waypoint (repère écran). On choisit la perpendiculaire de ce côté.
+    var mLat = 0.0, mLng = 0.0;
+    for (final p in trace) { mLat += p.latitude; mLng += p.longitude; }
+    mLat /= trace.length; mLng /= trace.length;
+    final outX = (at.longitude - mLng) * cosLat;
+    final outY = -(at.latitude - mLat);
+    if (outX * outX + outY * outY > 1e-12) {
+      if (px * outX + py * outY < 0) { px = -px; py = -py; }
+    } else {
+      if (py > 1e-6) { px = -px; py = -py; } // vers le haut
+      else if (py.abs() <= 1e-6 && px < 0) { px = -px; } // sinon vers la droite
+    }
     return Offset(px, py);
   }
 
-  /// Marker waypoint : pin flottant décalé perpendiculairement à la trace, relié
-  /// par une fine ligne à un point posé sur sa vraie position GPS. La boîte est
-  /// centrée sur la coordonnée (alignment center) et assez grande pour contenir
-  /// le décalage dans n'importe quelle direction.
-  Marker _waypointMarker(LatLng at, int number) {
-    const color = Color(0xFF3B82F6);
-    const lead = 30.0; // longueur de la ligne de rappel (px écran)
+  /// Marker waypoint : pastille ronde numérotée décalée perpendiculairement à la
+  /// trace, reliée par un fin trait de rappel à un point posé sur sa vraie
+  /// position GPS. Même représentation que l'écran détail du ride de l'app mobile
+  /// (pastille numérotée plutôt qu'une goutte). La boîte est centrée sur la
+  /// coordonnée (alignment center) et assez grande pour contenir le décalage dans
+  /// n'importe quelle direction.
+  Marker _waypointMarker(Map cp, int number) {
+    const color = Color(0xFF2563EB); // bleu soutenu, bon contraste avec le blanc
+    const lead = 30.0;   // longueur du trait de rappel (px écran)
     const box = 120.0;
+    const badge = 30.0;  // diamètre de la pastille numérotée
+    final at = LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble());
     final dir = _leaderDirection(at);
     final tip = Offset(dir.dx * lead, dir.dy * lead);
+    final angle = math.atan2(tip.dy, tip.dx);
     return Marker(
       point: at,
       width: box,
@@ -838,8 +861,18 @@ class _LivePageState extends State<LivePage> {
       child: Stack(
         alignment: Alignment.center,
         children: [
-          // Ligne de rappel : du point GPS (centre) vers le pin.
-          CustomPaint(size: const Size(box, box), painter: _LeaderLinePainter(tip, color)),
+          // Trait de rappel : du point GPS (centre) vers la pastille.
+          Transform.translate(
+            offset: Offset(tip.dx / 2, tip.dy / 2),
+            child: Transform.rotate(
+              angle: angle,
+              child: Container(
+                width: lead, height: 2,
+                decoration: BoxDecoration(
+                  color: color, borderRadius: BorderRadius.circular(1)),
+              ),
+            ),
+          ),
           // Point posé sur la trace = vraie position GPS du waypoint.
           Container(
             width: 9, height: 9,
@@ -848,28 +881,33 @@ class _LivePageState extends State<LivePage> {
               border: Border.all(color: Colors.white, width: 1.5),
             ),
           ),
-          // Pin flottant numéroté, tip à l'extrémité de la ligne.
+          // Pastille ronde numérotée, déportée au bout du trait. Chiffre gros et
+          // centré → nettement plus lisible que le petit numéro logé dans la tête
+          // d'une goutte location_on. Seule la pastille est cliquable (ouvre les
+          // infos du point) : le reste de la boîte laisse passer les gestes carte.
           Transform.translate(
-            offset: Offset(tip.dx, tip.dy - 17),
-            child: SizedBox(
-              width: 34, height: 34,
-              child: Stack(
-                alignment: Alignment.center,
-                children: [
-                  const Icon(Icons.location_on, color: color, size: 34,
-                      shadows: [Shadow(color: Colors.black45, blurRadius: 4)]),
-                  // Le centre de la tête ronde du pin est ~5px au-dessus du
-                  // centre géométrique → on remonte le numéro (le Stack le
-                  // garde centré horizontalement). Police réduite au-delà de
-                  // 9 pour que les nombres à 2 chiffres tiennent dans la tête.
-                  Transform.translate(
-                    offset: const Offset(0, -5),
-                    child: Text('$number',
-                        style: TextStyle(color: Colors.white,
-                            fontSize: number >= 10 ? 10 : 13,
-                            fontWeight: FontWeight.w700, height: 1)),
+            offset: tip,
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => _showCheckpointInfo(cp, number),
+                child: Container(
+                  width: badge, height: badge,
+                  alignment: Alignment.center,
+                  decoration: BoxDecoration(
+                    color: color, shape: BoxShape.circle,
+                    border: Border.all(color: Colors.white, width: 2),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withValues(alpha: 0.45), blurRadius: 4),
+                    ],
                   ),
-                ],
+                  child: Text('$number',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: number >= 10 ? 13 : 16,
+                      fontWeight: FontWeight.w800, height: 1),
+                  ),
+                ),
               ),
             ),
           ),
@@ -927,7 +965,7 @@ class _LivePageState extends State<LivePage> {
             // superposition avec les markers départ/arrivée. Cf _waypointMarker.
             for (final (i, cp) in _checkpoints.indexed)
               if (cp['lat'] != null && cp['lng'] != null)
-                _waypointMarker(LatLng((cp['lat'] as num).toDouble(), (cp['lng'] as num).toDouble()), i + 1),
+                _waypointMarker(cp, i + 1),
           ]),
         ],
     );
@@ -1622,6 +1660,123 @@ class _LivePageState extends State<LivePage> {
     });
   }
 
+  /// Tap sur la pastille numérotée d'un point de passage sur la carte.
+  /// - Smartphone : feuille modale glissante avec les infos du point (heure,
+  ///   note, photos, coordonnées), calquée sur l'écran détail du ride mobile.
+  /// - Navigateur : ouvre simplement le volet « Points de passage » et fait
+  ///   défiler jusqu'au point cliqué, mis en évidence.
+  void _showCheckpointInfo(Map cp, int number) {
+    final isMobileLayout = MediaQuery.sizeOf(context).width < 900;
+    if (isMobileLayout) {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: const Color(0xFF18181B),
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        builder: (ctx) => SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 10, 20, 20),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
+              const SizedBox(height: 16),
+              _buildCheckpointDetail(cp, number),
+            ]),
+          ),
+        ),
+      );
+    } else {
+      setState(() {
+        _highlightedCheckpoint = number - 1;
+        _waypointsPanelOpen = true;
+      });
+      // Défilement vers l'item mis en évidence, une fois le volet en place.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final ctx = _highlightKey.currentContext;
+        if (ctx != null) {
+          Scrollable.ensureVisible(ctx,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeInOut,
+              alignment: 0.3);
+        }
+      });
+    }
+  }
+
+  /// Contenu partagé (feuille mobile / dialogue navigateur) des infos d'un point.
+  Widget _buildCheckpointDetail(Map cp, int number) {
+    const color = Color(0xFF2563EB);
+    final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final timeStr = dt != null ? '${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}' : '--:--:--';
+    final comment = (cp['comment'] as String?)?.trim() ?? '';
+    final photoUrls = (cp['photo_urls'] as List?)?.cast<String>() ?? const [];
+    final lat = (cp['lat'] as num?)?.toDouble();
+    final lng = (cp['lng'] as num?)?.toDouble();
+    return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Container(
+          width: 26, height: 26,
+          alignment: Alignment.center,
+          decoration: const BoxDecoration(color: color, shape: BoxShape.circle),
+          child: Text('$number',
+            style: TextStyle(color: Colors.white, fontSize: number >= 10 ? 12 : 14, fontWeight: FontWeight.w800, height: 1)),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text('Point mémorisé · $timeStr',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white)),
+        ),
+      ]),
+      const SizedBox(height: 12),
+      if (comment.isNotEmpty)
+        Text(comment, style: const TextStyle(fontSize: 15, color: Colors.white70, height: 1.4))
+      else
+        const Text('Aucune note', style: TextStyle(fontSize: 15, color: Colors.white38, fontStyle: FontStyle.italic)),
+      if (photoUrls.isNotEmpty) ...[
+        const SizedBox(height: 16),
+        SizedBox(
+          height: 100,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: photoUrls.length,
+            separatorBuilder: (_, _) => const SizedBox(width: 8),
+            itemBuilder: (_, i) => GestureDetector(
+              onTap: () => _openPhotoGallery(photoUrls, i),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.network(
+                  photoUrls[i], height: 100, width: 100, fit: BoxFit.cover,
+                  loadingBuilder: (ctx, child, progress) => progress == null
+                      ? child
+                      : Container(
+                          width: 100, height: 100,
+                          color: const Color(0xFF2A2A2A),
+                          alignment: Alignment.center,
+                          child: const SizedBox(width: 18, height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white38)),
+                        ),
+                  errorBuilder: (ctx, error, stack) => Container(
+                    width: 100, height: 100,
+                    color: const Color(0xFF2A2A2A),
+                    child: const Icon(Icons.broken_image, color: Colors.white24, size: 22),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+      if (lat != null && lng != null) ...[
+        const SizedBox(height: 16),
+        Text('Lat ${lat.toStringAsFixed(6)}  ·  Long ${lng.toStringAsFixed(6)}',
+          style: const TextStyle(fontSize: 12, color: Colors.white38)),
+      ],
+    ]);
+  }
+
   Widget _buildTimelinePoint({
     required String type,
     required String label,
@@ -1630,6 +1785,7 @@ class _LivePageState extends State<LivePage> {
     List<String> photoUrls = const [],
     int? number,
     required bool isLast,
+    bool highlighted = false,
   }) {
     final Color dotColor;
     final Widget dotInner;
@@ -1686,10 +1842,22 @@ class _LivePageState extends State<LivePage> {
           Expanded(
             child: Padding(
               padding: EdgeInsets.only(top: 1, bottom: isLast ? 0 : 20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                padding: highlighted
+                    ? const EdgeInsets.fromLTRB(10, 8, 10, 8)
+                    : EdgeInsets.zero,
+                decoration: highlighted
+                    ? BoxDecoration(
+                        color: const Color(0xFF2563EB).withValues(alpha: 0.16),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFF2563EB).withValues(alpha: 0.5)),
+                      )
+                    : null,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
                   Row(children: [
                     Expanded(child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700))),
                     Text(timeStr, style: const TextStyle(color: Colors.white38, fontSize: 11)),
@@ -1733,6 +1901,7 @@ class _LivePageState extends State<LivePage> {
                     ),
                   ],
                 ],
+                ),
               ),
             ),
           ),
@@ -1766,12 +1935,17 @@ class _LivePageState extends State<LivePage> {
 
     for (final (i, cp) in _checkpoints.indexed) {
       final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
-      widgets.add(_buildTimelinePoint(
-        type: 'checkpoint', label: 'Point mémorisé', time: dt,
-        comment: cp['comment'] as String?,
-        photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
-        number: i + 1,
-        isLast: ++idx == total,
+      final isHighlighted = _highlightedCheckpoint == i;
+      widgets.add(KeyedSubtree(
+        key: isHighlighted ? _highlightKey : null,
+        child: _buildTimelinePoint(
+          type: 'checkpoint', label: 'Point mémorisé', time: dt,
+          comment: cp['comment'] as String?,
+          photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
+          number: i + 1,
+          isLast: ++idx == total,
+          highlighted: isHighlighted,
+        ),
       ));
     }
 
@@ -1840,7 +2014,10 @@ class _LivePageState extends State<LivePage> {
 
   Widget _buildWaypointsTab() {
     return GestureDetector(
-      onTap: () => setState(() => _waypointsPanelOpen = true),
+      onTap: () => setState(() {
+        _highlightedCheckpoint = null;
+        _waypointsPanelOpen = true;
+      }),
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
         decoration: BoxDecoration(
@@ -1880,7 +2057,10 @@ class _LivePageState extends State<LivePage> {
             Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
             const Spacer(),
             GestureDetector(
-              onTap: () => setState(() => _waypointsPanelOpen = false),
+              onTap: () => setState(() {
+                _highlightedCheckpoint = null;
+                _waypointsPanelOpen = false;
+              }),
               child: Container(
                 width: 28, height: 28,
                 decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
@@ -1975,28 +2155,4 @@ class _LivePageState extends State<LivePage> {
       ),
     );
   }
-}
-
-/// Fine ligne reliant le point GPS d'un waypoint (centre de la boîte) à son pin
-/// flottant décalé (`tip`, en coordonnées écran relatives au centre).
-class _LeaderLinePainter extends CustomPainter {
-  final Offset tip;
-  final Color color;
-  const _LeaderLinePainter(this.tip, this.color);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final c = Offset(size.width / 2, size.height / 2);
-    canvas.drawLine(
-      c,
-      c + tip,
-      Paint()
-        ..color = color
-        ..strokeWidth = 1.5
-        ..strokeCap = StrokeCap.round,
-    );
-  }
-
-  @override
-  bool shouldRepaint(_LeaderLinePainter old) => old.tip != tip || old.color != color;
 }

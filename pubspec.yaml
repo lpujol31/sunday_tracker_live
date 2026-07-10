@@ -19,7 +19,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 
 # Version app + build number interne.
 # Format build : YYYYMMDDNN, ex. 2026062501 = 1er build du 25/06/2026.
-version: 1.0.1+2026070802
+version: 1.1.0+2026071103
 
 environment:
   sdk: ^3.11.5
