@@ -13,6 +13,9 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:intl/intl.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import 'ride_stats.dart';
+import 'stats_section.dart';
+
 const List<Map<String, dynamic>> kMapStyles = [
   {
     'label': 'Plan',
@@ -54,6 +57,14 @@ List<Color> _buildGradientColors(int count) {
     }
   });
 }
+
+/// Au-delà de ce trou entre deux positions, on considère que la sortie était en
+/// pause (le tracking envoie un point toutes les 5 à 15 s).
+const Duration _kPauseGap = Duration(seconds: 60);
+
+/// Contenu du volet latéral desktop, sélectionné par les onglets verticaux du
+/// bord droit.
+enum _SidePanel { waypoints, stats }
 
 class LivePage extends StatefulWidget {
   const LivePage({super.key});
@@ -101,17 +112,27 @@ class _LivePageState extends State<LivePage> {
   final shareCode = Uri.base.queryParameters['code'];
 
   List<Map<String, dynamic>> _checkpoints = [];
-  bool _waypointsPanelOpen = false;
+  /// Volet latéral desktop ouvert, ou null si replié. Les deux onglets verticaux
+  /// du bord droit partagent le même volet glissant.
+  _SidePanel? _openPanel;
   // Point de passage mis en évidence dans le volet desktop (tap sur sa pastille
   // carte). Index dans _checkpoints ; null = aucun. _highlightKey est attachée à
   // l'item correspondant pour l'y faire défiler automatiquement.
   int? _highlightedCheckpoint;
   final GlobalKey _highlightKey = GlobalKey();
+
+  /// Dénivelé et vitesse, recalculés à chaque chargement depuis les points GPS
+  /// (le mobile ne les transmet pas au live — cf. RideStats).
+  RideStats _stats = RideStats.empty;
   bool _versionExpanded = false;
-  bool _mobilePanelExpanded = false;
 
   final GlobalKey _refreshBtnKey = GlobalKey();
   OverlayEntry? _refreshMenuEntry;
+
+  // Overlays posés sur la carte : leur hauteur réelle sert de marge au cadrage
+  // du tracé, pour qu'il ne passe pas dessous.
+  final GlobalKey _topOverlayKey = GlobalKey();
+  final GlobalKey _bottomOverlayKey = GlobalKey();
 
   @override
   void initState() {
@@ -133,29 +154,25 @@ class _LivePageState extends State<LivePage> {
     super.dispose();
   }
 
+  /// Titre du panneau : l'heure du point affiché (arrivée si le ride est
+  /// terminé, dernière position reçue sinon). La fraîcheur du signal reste
+  /// portée par l'indicateur de signal.
   String _formatSinceLastUpdate() {
-    if (_isFinished && lastUpdate != null) {
-      final dt = lastUpdate!.toLocal();
-      return 'Arrivée à ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-    }
     if (rideStatus == 'unknown' || lastUpdate == null) return 'Position inconnue';
-    final s = _sinceLastUpdate.inSeconds;
-    if (s < 60) return 'il y a $s s';
-    final m = _sinceLastUpdate.inMinutes;
-    if (m < 60) return 'il y a $m min';
-    final h = _sinceLastUpdate.inHours;
-    return 'il y a ${h}h${(m - h * 60).toString().padLeft(2, '0')}';
+    final dt = lastUpdate!.toLocal();
+    final hhmm = '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+    return _isFinished ? 'Arrivée à $hhmm' : 'Position actuelle à $hhmm';
   }
 
   Widget _buildStatusPill() {
     final color = getStatusColor();
     final icon = getStatusIcon();
     final label = _isFinished ? 'Ride terminé'
-        : rideStatus == 'in_progress' ? 'En cours'
-        : rideStatus == 'paused' ? 'En pause'
+        : rideStatus == 'in_progress' ? 'Ride en cours'
+        : rideStatus == 'paused' ? 'Ride en pause'
         : 'Statut du ride indisponible';
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.15),
         borderRadius: BorderRadius.circular(20),
@@ -164,9 +181,9 @@ class _LivePageState extends State<LivePage> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color, size: 11),
-          const SizedBox(width: 5),
-          Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+          Icon(icon, color: color, size: 13),
+          const SizedBox(width: 6),
+          Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w700)),
         ],
       ),
     );
@@ -212,7 +229,7 @@ class _LivePageState extends State<LivePage> {
 
   IconData getStatusIcon() {
     switch (rideStatus) {
-      case 'in_progress': return Icons.play_circle;
+      case 'in_progress': return Icons.circle;
       case 'paused': return Icons.pause_circle;
       case 'finished': return Icons.check_circle;
       default: return Icons.help;
@@ -221,7 +238,8 @@ class _LivePageState extends State<LivePage> {
 
   Color getStatusColor() {
     switch (rideStatus) {
-      case 'in_progress': return const Color(0xFF3B82F6);
+      // Violet : couleur du ride en cours (pastille « dernière position »).
+      case 'in_progress': return const Color(0xFF8B5CF6);
       case 'paused': return const Color(0xFFFACC15);
       case 'finished': return const Color(0xFF4CAF50);
       default: return Colors.grey;
@@ -353,13 +371,51 @@ class _LivePageState extends State<LivePage> {
       dist += _haversineMeters(distPoints[i - 1], distPoints[i]);
     }
     _totalDistanceMeters = dist;
-    // Durée : toujours depuis les timestamps de safety_positions
+    // Durée : somme des intervalles entre positions consécutives, en excluant
+    // les trous > _kPauseGap. Pendant une pause le tracking est coupé : aucune
+    // position n'est envoyée, ce qui creuse un trou dans les timestamps. Prendre
+    // « dernière - première » compterait la pause dans la durée (une pause de
+    // 30 min affichait 44 min de sortie au lieu de 12).
+    // Estimation à quelques dizaines de secondes près : le trou commence au
+    // dernier fix GPS, pas au clic sur Pause. La valeur exacte (chrono de
+    // l'app) remplace celle-ci dès que la sortie est terminée, via ride_json.
     final chronoPoints = positions.reversed.toList();
-    if (chronoPoints.length >= 2) {
-      final first = DateTime.tryParse(chronoPoints.first['created_at'] ?? '');
-      final last = DateTime.tryParse(chronoPoints.last['created_at'] ?? '');
-      if (first != null && last != null) _rideDuration = last.difference(first).abs();
+    var active = Duration.zero;
+    for (int i = 1; i < chronoPoints.length; i++) {
+      final prev = DateTime.tryParse(chronoPoints[i - 1]['created_at'] ?? '');
+      final cur = DateTime.tryParse(chronoPoints[i]['created_at'] ?? '');
+      if (prev == null || cur == null) continue;
+      final step = cur.difference(prev);
+      if (step <= Duration.zero || step > _kPauseGap) continue;
+      active += step;
     }
+    _rideDuration = active;
+  }
+
+  /// Dénivelé + vitesse. Sur un ride terminé on part du tracé dense de
+  /// `ride_json` (un point tous les ~5 m, avec altitude) ; pendant la sortie on
+  /// se rabat sur les positions de suivi (~15 s), dont l'altitude n'est présente
+  /// que si la RPC projette la colonne — sinon le dénivelé est simplement masqué.
+  /// À appeler après `_computeStats` : la vitesse moyenne se déduit de la
+  /// distance et de la durée déjà calculées.
+  void _computeRideStats(List<Map<String, dynamic>> positions) {
+    final samples = <RideSample>[];
+    if (_isFinished && _rideJsonPoints.isNotEmpty) {
+      for (final p in _rideJsonPoints) {
+        final s = RideSample.fromRideJsonPoint(p);
+        if (s != null) samples.add(s);
+      }
+    } else {
+      for (final p in positions.reversed) {
+        final s = RideSample.fromPosition(p);
+        if (s != null) samples.add(s);
+      }
+    }
+    _stats = RideStats.fromSamples(
+      samples,
+      distanceMeters: _totalDistanceMeters,
+      duration: _rideDuration,
+    );
   }
 
   String _formatDistance(double meters) {
@@ -380,6 +436,31 @@ class _LivePageState extends State<LivePage> {
     return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
   }
 
+  double _overlayHeight(GlobalKey key) {
+    final box = key.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return 0;
+    return box.size.height;
+  }
+
+  /// Marges du cadrage : la carte occupe tout l'écran, mais le bandeau du haut,
+  /// le panneau du bas et le volet droit la recouvrent. On les déduit de la zone
+  /// utile pour que le tracé rentre entièrement dans ce qui reste visible.
+  /// Chaque marge est bornée pour ne jamais dévorer la carte (sinon le fit
+  /// renvoie un zoom aberrant).
+  EdgeInsets _mapFitPadding() {
+    final size = MediaQuery.sizeOf(context);
+    final isMobileLayout = size.width < 900;
+    final top = _overlayHeight(_topOverlayKey).clamp(0.0, size.height * 0.30);
+    final bottom = _overlayHeight(_bottomOverlayKey).clamp(0.0, size.height * 0.50);
+    final right = (!isMobileLayout && _openPanel != null) ? 340.0 : 0.0;
+    return EdgeInsets.fromLTRB(
+      24,
+      top + 16,
+      right.clamp(0.0, size.width * 0.40) + 24,
+      bottom + 16,
+    );
+  }
+
   /// Ajuste la caméra aux points. Renvoie true si un vrai fit a eu lieu
   /// (zoom fini), false si on a dû retomber sur un recentrage de secours.
   bool _fitBounds(List<LatLng> points) {
@@ -397,7 +478,7 @@ class _LivePageState extends State<LivePage> {
     }
     final bounds = LatLngBounds.fromPoints(points);
     try {
-      mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(48)));
+      mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: _mapFitPadding()));
       // Si le fit s'est produit avant que la carte ait une taille valide, le
       // zoom résultant peut être infini/NaN et fait planter la TileLayer au
       // rendu. On corrige alors par un recentrage à zoom fixe.
@@ -494,7 +575,6 @@ class _LivePageState extends State<LivePage> {
       final newStatus = session['status'] ?? 'unknown';
       _checkStatusChange(newStatus);
       rideStatus = newStatus;
-      rideStartTime = DateTime.tryParse(session['started_at'] ?? '');
       final parsedPositions = ((result['positions'] as List?) ?? [])
           .map((p) => Map<String, dynamic>.from(p as Map))
           .toList();
@@ -502,6 +582,16 @@ class _LivePageState extends State<LivePage> {
         setState(() { errorMessage = 'Aucune position disponible'; isLoading = false; isRefreshing = false; });
         return;
       }
+      // Heure de départ : `started_at` est posé par le téléphone, alors que le
+      // `created_at` des positions est horodaté à l'insertion côté serveur. Les
+      // deux horloges diffèrent, et sur un ride qui vient de démarrer la première
+      // position pouvait apparaître AVANT le départ. On retient donc le plus
+      // ancien des deux (positions triées du plus récent au plus ancien).
+      final startedAt = DateTime.tryParse(session['started_at'] ?? '');
+      final firstPointAt = DateTime.tryParse(parsedPositions.last['created_at'] ?? '');
+      rideStartTime = startedAt == null || (firstPointAt != null && firstPointAt.isBefore(startedAt))
+          ? firstPointAt
+          : startedAt;
       // Les waypoints sont stockés localement sur le téléphone pendant le ride.
       // Ils arrivent dans safety_sessions.ride_json['waypoints'] uniquement à la fin.
       List<Map<String, dynamic>> parsedCheckpoints = [];
@@ -545,6 +635,7 @@ class _LivePageState extends State<LivePage> {
         } catch (_) {}
       }
       if (!statsFromRideJson) _computeStats(parsedPositions);
+      _computeRideStats(parsedPositions);
       final latestPosition = parsedPositions.first;
       setState(() {
         tracePositions = parsedPositions;
@@ -718,34 +809,6 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
-  /// Amélioration 6 : copier le lien de partage dans le presse-papier (web)
-  Future<void> _copyShareLink() async {
-    try {
-      final url = Uri.base.toString();
-      final ta = html.document.createElement('textarea') as dynamic;
-      ta.value = url;
-      html.document.body!.append(ta);
-      ta.select();
-      html.document.execCommand('copy');
-      ta.remove();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('✅ Lien copié dans le presse-papier'),
-          backgroundColor: Color(0xFF166534),
-          behavior: SnackBarBehavior.floating,
-          duration: Duration(seconds: 3),
-        ));
-      }
-    } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Impossible de copier le lien'),
-          behavior: SnackBarBehavior.floating,
-        ));
-      }
-    }
-  }
-
   /// Change le fond de carte en préservant la position/zoom courants.
   /// La carte est recréée (nouveau MapController) car flutter_map ne permet
   /// pas de changer le maxZoom à chaud.
@@ -766,34 +829,6 @@ class _LivePageState extends State<LivePage> {
       mapController = MapController();
       _mapReady = false;
     });
-  }
-
-  Widget _buildMapStyleSelector() {
-    return Container(
-      decoration: BoxDecoration(color: Colors.black.withValues(alpha: 0.65), borderRadius: BorderRadius.circular(20)),
-      padding: const EdgeInsets.all(3),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: List.generate(kMapStyles.length, (i) {
-          final style = kMapStyles[i];
-
-          final isActive = i == _mapStyleIndex;
-          return GestureDetector(
-            onTap: () => _changeMapStyle(i),
-            child: AnimatedContainer(
-              duration: const Duration(milliseconds: 200),
-              margin: const EdgeInsets.symmetric(horizontal: 2),
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              decoration: BoxDecoration(color: isActive ? Colors.white : Colors.transparent, borderRadius: BorderRadius.circular(16)),
-              child: Row(children: [
-                Icon(style['icon'] as IconData, size: 13, color: isActive ? Colors.black : Colors.white70),
-                if (isActive) ...[const SizedBox(width: 4), Text(style['label'] as String, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.black))],
-              ]),
-            ),
-          );
-        }),
-      ),
-    );
   }
 
   /// Direction unitaire (repère écran) PERPENDICULAIRE à la trace au niveau du
@@ -996,33 +1031,8 @@ class _LivePageState extends State<LivePage> {
               ],
             ),
           ),
-          if (!isMobile && !_isFinished) ...[
-            if (isRefreshing)
-              const Padding(
-                padding: EdgeInsets.only(right: 8, top: 2),
-                child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange)),
-              ),
-            GestureDetector(
-              onTap: isRefreshing ? null : () => loadLastPosition(manual: true),
-              child: const Padding(padding: EdgeInsets.all(8), child: Icon(Icons.refresh, color: Colors.orange, size: 22)),
-            ),
-            DropdownButtonHideUnderline(child: DropdownButton<int>(
-              value: refreshIntervalSeconds,
-              dropdownColor: const Color(0xFF1B1B1B),
-              iconEnabledColor: Colors.orange,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-              items: const [
-                DropdownMenuItem(value: 0, child: Text('Off')),
-                DropdownMenuItem(value: 15, child: Text('15 s')),
-                DropdownMenuItem(value: 30, child: Text('30 s')),
-                DropdownMenuItem(value: 60, child: Text('60 s')),
-              ],
-              onChanged: (v) { if (v != null) changeRefreshInterval(v); },
-            )),
-            const SizedBox(width: 8),
-          ],
-          // Le rafraîchissement mobile est désormais géré par le bouton sync
-          // du groupe de contrôles carte (plus de doublon ⋮ ici).
+          // Le rafraîchissement (manuel + intervalle auto) est géré par le bouton
+          // sync du groupe de contrôles carte, en mobile comme en desktop.
         ],
       ),
     );
@@ -1044,203 +1054,399 @@ class _LivePageState extends State<LivePage> {
     return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
   }
 
-  Widget _buildStatBlock(String label, String value) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
-        const SizedBox(height: 2),
-        Text(value, style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 17, fontWeight: FontWeight.bold)),
-      ],
+  /// Pastille de départ / arrivée / dernière position : cercle plein avec halo,
+  /// mêmes couleurs que les markers de la carte. `tail` ajoute une courte
+  /// traînée de pointillés sous la pastille (ride en cours, où les deux points
+  /// sont côte à côte et non reliés entre eux).
+  Widget _buildEndpointDot(Color color, IconData icon, {bool tail = false}) {
+    final dot = Container(
+      width: 38, height: 38,
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 12, spreadRadius: 1)],
+      ),
+      child: Icon(icon, color: Colors.white, size: 20),
+    );
+    if (!tail) return dot;
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      dot,
+      const SizedBox(height: 5),
+      for (var i = 0; i < 3; i++)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 1.5),
+          child: Container(
+            width: 3, height: 3,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 1 - i * 0.25),
+              shape: BoxShape.circle,
+            ),
+          ),
+        ),
+    ]);
+  }
+
+  /// Pointillés reliant la pastille de départ à celle d'arrivée, en dégradé
+  /// orange → violet comme la trace sur la carte.
+  Widget _buildEndpointConnector() {
+    const start = Color(0xFFFF8A00);
+    const end = Color(0xFF6D28D9);
+    return SizedBox(
+      width: 38,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) => Padding(
+            padding: const EdgeInsets.symmetric(vertical: 1.5),
+            child: Container(
+              width: 3, height: 3,
+              decoration: BoxDecoration(
+                color: Color.lerp(start, end, i / 2)!,
+                shape: BoxShape.circle,
+              ),
+            ),
+          )),
+        ),
+      ),
     );
   }
 
-  Widget _buildDepartBlock() {
-    return Column(
+  /// Carte Départ / Arrivée / Dernière position : libellé coloré, puis date et
+  /// heure sur une seule ligne (la date rétrécit plutôt que de déborder dans le
+  /// volet droit, plus étroit).
+  Widget _buildEndpointCard({
+    required String label,
+    required Color color,
+    required String date,
+    required String time,
+  }) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(11, 8, 11, 9),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(label.toUpperCase(),
+            style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6)),
+          const SizedBox(height: 5),
+          Row(children: [
+            Flexible(
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
+                  const SizedBox(width: 6),
+                  Text(date, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700)),
+                  const SizedBox(width: 10),
+                  const Icon(Icons.access_time, color: Colors.white38, size: 12),
+                  const SizedBox(width: 6),
+                  Text(time, style: const TextStyle(color: Colors.white70, fontSize: 13)),
+                ]),
+              ),
+            ),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  /// Carte Distance / Durée : libellé + valeur orange, pastille d'icône à droite.
+  Widget _buildMetricCard({
+    required String label,
+    required String value,
+    required IconData icon,
+  }) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Row(children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              const SizedBox(height: 1),
+              FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Text(value,
+                  style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 20, fontWeight: FontWeight.bold, height: 1.2)),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(width: 8),
+        Container(
+          width: 32, height: 32,
+          decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.07), shape: BoxShape.circle),
+          child: Icon(icon, color: Colors.white54, size: 17),
+        ),
+      ]),
+    );
+  }
+
+  /// Bilan d'un ride terminé : timeline départ → arrivée à gauche, distance /
+  /// durée + bouton à droite. La carte fait 560 px en bas de l'écran desktop ;
+  /// sous 400 px de contenu (volet droit de 340, mobile) les deux colonnes
+  /// s'empilent au lieu de déborder.
+  Widget _buildFinishedSummary() {
+    final timeline = Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text('Départ', style: TextStyle(color: Colors.white54, fontSize: 11)),
-        const SizedBox(height: 2),
-        Text(_formatStartDateFr(), style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
-        Text(_formatStartTime(), style: const TextStyle(color: Colors.white60, fontSize: 12)),
+        Row(children: [
+          _buildEndpointDot(const Color(0xFFFF8A00), Icons.play_arrow),
+          const SizedBox(width: 10),
+          Expanded(child: _buildEndpointCard(
+            label: 'Départ',
+            color: const Color(0xFFFF8A00),
+            date: _formatStartDateFr(),
+            time: _formatStartTime(),
+          )),
+        ]),
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: _buildEndpointConnector(),
+        ),
+        Row(children: [
+          _buildEndpointDot(const Color(0xFF6D28D9), Icons.sports_score_sharp),
+          const SizedBox(width: 10),
+          Expanded(child: _buildEndpointCard(
+            label: 'Arrivée',
+            color: const Color(0xFF6D28D9),
+            date: _formatUpdateDateFr(),
+            time: lastUpdate != null ? DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()) : '--:--:--',
+          )),
+        ]),
+      ],
+    );
+
+    final distance = _buildMetricCard(
+      label: 'Distance',
+      value: _formatDistance(_totalDistanceMeters),
+      icon: Icons.add_road,
+    );
+    final duree = _buildMetricCard(
+      label: 'Durée',
+      value: _formatDuration(_rideDuration),
+      icon: Icons.schedule,
+    );
+
+    return LayoutBuilder(builder: (context, constraints) {
+      if (constraints.maxWidth < 400) {
+        return Column(mainAxisSize: MainAxisSize.min, children: [
+          timeline,
+          const SizedBox(height: 8),
+          distance,
+          const SizedBox(height: 8),
+          duree,
+          const SizedBox(height: 10),
+          _buildOpenPositionButton(),
+        ]);
+      }
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Expanded(child: timeline),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              distance,
+              const SizedBox(height: 8),
+              duree,
+              const SizedBox(height: 8),
+              _buildOpenPositionButton(),
+            ]),
+          ),
+        ],
+      );
+    });
+  }
+
+  Widget _buildOpenPositionButton() {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () => _showNavigationSheet(context),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 9),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(colors: [Color(0xFF6D28D9), Color(0xFFB026F0)]),
+          borderRadius: BorderRadius.circular(12),
+        ),
+        child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(Icons.map_outlined, color: Colors.white, size: 16),
+          SizedBox(width: 8),
+          Text('Ouvrir la position',
+            style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
+        ]),
+      ),
+    );
+  }
+
+  /// Ride en cours : départ et dernière position côte à côte (chacun avec sa
+  /// pastille et sa traînée de pointillés, comme les markers de la carte), puis
+  /// distance / durée et le bouton. Sous 400 px de contenu, tout s'empile.
+  Widget _buildLiveSummary() {
+    final depart = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _buildEndpointDot(const Color(0xFFFF8A00), Icons.play_arrow, tail: true),
+      const SizedBox(width: 10),
+      Expanded(child: _buildEndpointCard(
+        label: 'Départ',
+        color: const Color(0xFFFF8A00),
+        date: _formatStartDateFr(),
+        time: _formatStartTime(),
+      )),
+    ]);
+    final derniere = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _buildEndpointDot(const Color(0xFF6D28D9), Icons.location_on, tail: true),
+      const SizedBox(width: 10),
+      Expanded(child: _buildEndpointCard(
+        label: 'Dernière position',
+        color: const Color(0xFF8B5CF6),
+        date: _formatUpdateDateFr(),
+        time: lastUpdate != null ? DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()) : '--:--:--',
+      )),
+    ]);
+    final distance = _buildMetricCard(
+      label: 'Distance',
+      value: _formatDistance(_totalDistanceMeters),
+      icon: Icons.add_road,
+    );
+    final duree = _buildMetricCard(
+      label: 'Durée',
+      value: _formatDuration(_rideDuration),
+      icon: Icons.schedule,
+    );
+
+    return LayoutBuilder(builder: (context, constraints) {
+      final narrow = constraints.maxWidth < 400;
+      return Column(mainAxisSize: MainAxisSize.min, children: [
+        if (narrow) ...[
+          depart,
+          const SizedBox(height: 8),
+          derniere,
+          const SizedBox(height: 8),
+          distance,
+          const SizedBox(height: 8),
+          duree,
+        ] else ...[
+          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Expanded(child: depart),
+            const SizedBox(width: 12),
+            Expanded(child: derniere),
+          ]),
+          const SizedBox(height: 8),
+          IntrinsicHeight(
+            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Expanded(child: distance),
+              const SizedBox(width: 12),
+              Expanded(child: duree),
+            ]),
+          ),
+        ],
+        const SizedBox(height: 10),
+        _buildOpenPositionButton(),
+      ]);
+    });
+  }
+
+  /// Contenu du panneau du ride, dans les deux états : en direct (départ +
+  /// dernière position) ou terminé (bilan départ → arrivée). Partagé par la
+  /// carte flottante desktop et le panneau glissant mobile, qui apportent chacun
+  /// leur propre fond.
+  Widget _buildPositionCardContent() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(children: [
+          Text(_isFinished ? 'DERNIÈRE POSITION CONNUE' : 'POSITION EN DIRECT',
+            style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1.0)),
+          const Spacer(),
+          _buildStatusPill(),
+        ]),
+        const SizedBox(height: 6),
+        Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+          const Icon(Icons.location_on, color: Colors.red, size: 20),
+          const SizedBox(width: 6),
+          Flexible(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(_formatSinceLastUpdate(),
+                style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
+            ),
+          ),
+          // Fraîcheur du signal : seule info que les cartes date/heure ne donnent
+          // pas d'un coup d'œil.
+          if (!_isFinished) ...[
+            const SizedBox(width: 8),
+            _buildSignalIndicator(),
+          ],
+        ]),
+        const SizedBox(height: 8),
+        Container(height: 1, color: Colors.white12),
+        const SizedBox(height: 10),
+        if (_isFinished) _buildFinishedSummary() else _buildLiveSummary(),
       ],
     );
   }
 
   Widget _buildPositionCard() {
     return Container(
-      padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
       decoration: BoxDecoration(
         color: const Color(0xFF1B1B1B),
         borderRadius: BorderRadius.circular(16),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(children: [
-            const Text('DERNIÈRE POSITION CONNUE',
-              style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
-            const Spacer(),
-            if (rideStatus == 'in_progress' || rideStatus == 'paused')
-              _buildSignalIndicator()
-            else if (_isFinished)
-              _buildStatusPill(),
-          ]),
-          const SizedBox(height: 6),
-          if (!_isFinished) ...[
-            _buildStatusPill(),
-            const SizedBox(height: 6),
-          ],
-          Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-            const Icon(Icons.location_on, color: Colors.red, size: 20),
-            const SizedBox(width: 8),
-            Text(_formatSinceLastUpdate(),
-              style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
-          ]),
-          if (lastUpdate != null) ...[
-            const SizedBox(height: 8),
-            Row(children: [
-              const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
-              const SizedBox(width: 6),
-              Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
-              const SizedBox(width: 14),
-              const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
-              const SizedBox(width: 6),
-              Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
-                style: const TextStyle(color: Colors.white60, fontSize: 11)),
-            ]),
-          ],
-          const SizedBox(height: 12),
-          Row(children: [
-            Expanded(
-              flex: 3,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => _showNavigationSheet(context),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 9),
-                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
-                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(Icons.map_outlined, color: Colors.white, size: 15),
-                    SizedBox(width: 6),
-                    Text('Ouvrir la position',
-                      style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
-                  ]),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            Expanded(
-              flex: 2,
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _copyShareLink,
-                child: Container(
-                  padding: const EdgeInsets.symmetric(vertical: 9),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF232323),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: Colors.white12),
-                  ),
-                  child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                    Icon(Icons.link, color: Colors.white38, size: 14),
-                    SizedBox(width: 5),
-                    Text('Copier le lien',
-                      style: TextStyle(color: Colors.white38, fontSize: 11)),
-                  ]),
-                ),
-              ),
-            ),
-          ]),
-        ],
-      ),
+      child: _buildPositionCardContent(),
     );
   }
 
+  /// Bas de l'écran desktop : mêmes contrôles carte flottants qu'en mobile,
+  /// empilés au-dessus de l'unique carte « dernière position » (qui embarque
+  /// désormais les stats de la sortie). Quand le volet droit est ouvert, il
+  /// reprend la carte position et les contrôles se décalent pour rester visibles
+  /// à gauche du volet.
   Widget _buildDesktopBottomBar(double bottomPadding) {
-    return Padding(
-      padding: EdgeInsets.fromLTRB(20, 0, 20, 14 + bottomPadding),
-      child: IntrinsicHeight(
-        child: Row(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+    return AnimatedPadding(
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeInOut,
+      padding: EdgeInsets.fromLTRB(20, 0, 20 + (_openPanel != null ? 340 : 0), 14 + bottomPadding),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          Container(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1B1B1B),
-              borderRadius: BorderRadius.circular(16),
-            ),
-            child: IntrinsicWidth(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Row(
-                    children: [
-                      _buildMapStyleSelector(),
-                      const Spacer(),
-                      GestureDetector(
-                        onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
-                        child: Container(
-                          width: 36, height: 36,
-                          decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
-                          child: const Icon(Icons.fit_screen, color: Colors.white, size: 18),
-                        ),
-                      ),
-                      const SizedBox(width: 6),
-                      GestureDetector(
-                        onTap: _recenter,
-                        child: Container(
-                          width: 36, height: 36,
-                          decoration: BoxDecoration(color: Colors.black26, borderRadius: BorderRadius.circular(10)),
-                          child: const Icon(Icons.my_location, color: Colors.white, size: 18),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  Container(height: 1, color: Colors.white24),
-                  const SizedBox(height: 10),
-                  IntrinsicHeight(
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters)),
-                        const SizedBox(width: 12),
-                        Container(width: 1, color: Colors.white12),
-                        const SizedBox(width: 12),
-                        _buildStatBlock('Durée', _formatDuration(_rideDuration)),
-                        const SizedBox(width: 12),
-                        Container(width: 1, color: Colors.white12),
-                        const SizedBox(width: 12),
-                        _buildDepartBlock(),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-          const Spacer(),
-          if (!_waypointsPanelOpen)
+          _buildMapControls(),
+          const SizedBox(height: 10),
+          // Le volet droit embarque déjà la carte position : on ne la duplique pas.
+          if (_openPanel == null)
             SizedBox(
-              width: 440,
+              width: 560,
               child: _buildPositionCard(),
             ),
         ],
       ),
-      ),
     );
   }
 
-  /// Groupe de contrôles carte flottant (mobile) — même look que l'app mobile
-  /// (ride en cours / détail du ride) : un seul bloc sombre flouté, boutons
-  /// collés. Le dernier bouton cycle entre les fonds de carte (Plan → Satellite
-  /// → Topo) en affichant l'icône du style courant.
-  Widget _buildMobileMapControls() {
+  /// Groupe de contrôles carte flottant, identique en mobile et en desktop —
+  /// même look que l'app mobile (ride en cours / détail du ride) : un seul bloc
+  /// sombre flouté, boutons collés. Le dernier bouton cycle entre les fonds de
+  /// carte (Plan → Satellite → Topo) en affichant l'icône du style courant.
+  Widget _buildMapControls() {
     Widget btn({Key? key, required Widget child, required VoidCallback onTap}) {
       return GestureDetector(
         onTap: onTap,
@@ -1291,161 +1497,180 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
+  /// Date + heure compactes, sans l'année : « 11 juil. 23:51 ». Les colonnes du
+  /// bandeau mobile sont trop étroites pour la date complète.
+  String _formatCompactDateTime(DateTime? dt) {
+    if (dt == null) return '--';
+    const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
+                    'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
+    final l = dt.toLocal();
+    final h = '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+    return '${l.day} ${months[l.month - 1]} $h';
+  }
+
+  /// Une colonne du bandeau compact mobile : icône + libellé, puis la valeur.
+  Widget _buildMobileStatColumn({
+    required IconData icon,
+    required Color iconColor,
+    required String label,
+    required String value,
+    Color valueColor = Colors.white,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(children: [
+          Icon(icon, size: 13, color: iconColor),
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(label,
+              style: const TextStyle(color: Colors.white60, fontSize: 11),
+              maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+        ]),
+        const SizedBox(height: 5),
+        // La date rétrécit plutôt que de déborder sur les colonnes voisines.
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          alignment: Alignment.centerLeft,
+          child: Text(value,
+            style: TextStyle(color: valueColor, fontSize: 14, fontWeight: FontWeight.w700)),
+        ),
+      ],
+    );
+  }
+
+  /// Bandeau compact du panneau mobile : Départ / Dernière position (ou Arrivée)
+  /// / Distance / Durée sur une seule ligne. Remplace les quatre cartes empilées
+  /// du desktop, qui mangeaient plus de la moitié de l'écran sur téléphone.
+  Widget _buildMobileSummaryStrip() {
+    Widget divider() => Container(width: 1, color: Colors.white12);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.04),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: IntrinsicHeight(
+        child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          Expanded(
+            child: _buildMobileStatColumn(
+              icon: Icons.play_circle,
+              iconColor: const Color(0xFFFF8A00),
+              label: 'Départ',
+              value: _formatCompactDateTime(rideStartTime),
+            ),
+          ),
+          divider(),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 10),
+              child: _buildMobileStatColumn(
+                icon: _isFinished ? Icons.sports_score_sharp : Icons.location_on,
+                iconColor: const Color(0xFF8B5CF6),
+                label: _isFinished ? 'Arrivée' : 'Dernière pos.',
+                value: _formatCompactDateTime(lastUpdate),
+              ),
+            ),
+          ),
+          divider(),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 10),
+              child: _buildMobileStatColumn(
+                icon: Icons.add_road,
+                iconColor: Colors.white54,
+                label: 'Distance',
+                value: _formatDistance(_totalDistanceMeters),
+                valueColor: const Color(0xFFFF8A00),
+              ),
+            ),
+          ),
+          divider(),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 10),
+              child: _buildMobileStatColumn(
+                icon: Icons.schedule,
+                iconColor: Colors.white54,
+                label: 'Durée',
+                value: _formatDuration(_rideDuration),
+                valueColor: const Color(0xFFFF8A00),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  /// Panneau mobile compact : en-tête position, bandeau des 4 chiffres clés, puis
+  /// deux actions. Tout le reste (points de passage, dénivelé, vitesse) part dans
+  /// la feuille « Voir les détails » — le panneau tient ainsi en bas de l'écran
+  /// sans jamais manger la carte.
   Widget _buildMobileBottomPanel(double bottomPadding) {
-    final expanded = _mobilePanelExpanded;
     return Padding(
       padding: EdgeInsets.fromLTRB(14, 0, 14, 12 + bottomPadding),
-      child: AnimatedSize(
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeInOut,
-        alignment: Alignment.bottomCenter,
-        child: Container(
-          padding: const EdgeInsets.fromLTRB(14, 4, 14, 12),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1B1B1B),
-            borderRadius: BorderRadius.circular(16),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Poignée de drag : tap ou glisser vertical pour agrandir/réduire
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () => setState(() => _mobilePanelExpanded = !expanded),
-                onVerticalDragEnd: (details) {
-                  final v = details.primaryVelocity ?? 0;
-                  if (v < -80) {
-                    setState(() => _mobilePanelExpanded = true);
-                  } else if (v > 80) {
-                    setState(() => _mobilePanelExpanded = false);
-                  }
-                },
-                child: Container(
-                  width: double.infinity,
-                  alignment: Alignment.center,
-                  padding: const EdgeInsets.symmetric(vertical: 8),
-                  child: Container(
-                    width: 40, height: 4,
-                    decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999)),
-                  ),
+      child: Container(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1B1B1B),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Text(_isFinished ? 'DERNIÈRE POSITION CONNUE' : 'POSITION EN DIRECT',
+                style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1.0)),
+              const Spacer(),
+              _buildStatusPill(),
+            ]),
+            const SizedBox(height: 8),
+            Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+              const Icon(Icons.location_on, color: Colors.red, size: 20),
+              const SizedBox(width: 6),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(_formatSinceLastUpdate(),
+                    style: const TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.bold, height: 1.1)),
                 ),
               ),
-              // En-tête position (toujours visible)
-              Row(children: [
-                const Text('DERNIÈRE POSITION CONNUE',
-                  style: TextStyle(color: Color(0xFFFF8A00), fontSize: 9, fontWeight: FontWeight.w700, letterSpacing: 1.0)),
-                const Spacer(),
-                if (rideStatus == 'in_progress' || rideStatus == 'paused')
-                  _buildSignalIndicator()
-                else if (_isFinished)
-                  _buildStatusPill(),
-              ]),
               if (!_isFinished) ...[
-                const SizedBox(height: 4),
-                _buildStatusPill(),
-              ],
-              const SizedBox(height: 4),
-              // Position (toujours visible)
-              Row(children: [
-                const Icon(Icons.location_on, color: Colors.red, size: 18),
-                const SizedBox(width: 6),
-                Text(_formatSinceLastUpdate(),
-                  style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-              ]),
-              // Date/heure de la dernière position (toujours visible)
-              if (lastUpdate != null) ...[
-                const SizedBox(height: 6),
-                Row(children: [
-                  const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
-                  const SizedBox(width: 5),
-                  Text(_formatUpdateDateFr(), style: const TextStyle(color: Colors.white60, fontSize: 11)),
-                  const SizedBox(width: 10),
-                  const Icon(Icons.access_time_outlined, color: Colors.white38, size: 12),
-                  const SizedBox(width: 5),
-                  Text(DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()),
-                    style: const TextStyle(color: Colors.white60, fontSize: 11)),
-                ]),
-              ],
-              const SizedBox(height: 12),
-              // Boutons (clôturent le bloc « dernière position », toujours visibles)
-              Row(children: [
-                Expanded(
-                  child: GestureDetector(
-                    behavior: HitTestBehavior.opaque,
-                    onTap: () => _showNavigationSheet(context),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(vertical: 10),
-                      decoration: BoxDecoration(color: const Color(0xFF6D28D9), borderRadius: BorderRadius.circular(10)),
-                      child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                        Icon(Icons.map_outlined, color: Colors.white, size: 15),
-                        SizedBox(width: 6),
-                        Text('Ouvrir la position', style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600)),
-                      ]),
-                    ),
-                  ),
-                ),
                 const SizedBox(width: 8),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _copyShareLink,
-                  child: Container(
-                    padding: const EdgeInsets.all(10),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF232323),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.white12),
-                    ),
-                    child: const Icon(Icons.link, color: Colors.white38, size: 18),
-                  ),
-                ),
-              ]),
-              // Détails supplémentaires (dépliés)
-              if (expanded) ...[
-                const SizedBox(height: 12),
-                Container(height: 1, color: Colors.white12),
-                const SizedBox(height: 12),
-                // Stats — Distance | Durée
-                IntrinsicHeight(
-                  child: Row(
-                    children: [
-                      Expanded(child: _buildStatBlock('Distance', _formatDistance(_totalDistanceMeters))),
-                      Container(width: 1, color: Colors.white12),
-                      Expanded(child: Padding(
-                        padding: const EdgeInsets.only(left: 14),
-                        child: _buildStatBlock('Durée', _formatDuration(_rideDuration)),
-                      )),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                // Départ — pleine largeur (plus de troncature)
-                _buildDepartBlock(),
-                const SizedBox(height: 12),
-                // Points de passage
-                GestureDetector(
-                  onTap: () => _showWaypointsBottomSheet(context),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.white.withValues(alpha: 0.05),
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.white12),
-                    ),
-                    child: Row(children: [
-                      const Icon(Icons.route, color: Color(0xFF4F9CFF), size: 14),
-                      const SizedBox(width: 8),
-                      const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600)),
-                      const SizedBox(width: 4),
-                      Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 12)),
-                      const Spacer(),
-                      const Icon(Icons.chevron_right, color: Colors.white38, size: 18),
-                    ]),
-                  ),
-                ),
+                _buildSignalIndicator(),
               ],
-            ],
-          ),
+            ]),
+            const SizedBox(height: 12),
+            _buildMobileSummaryStrip(),
+            const SizedBox(height: 10),
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => _showDetailsSheet(context),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.04),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: const Row(children: [
+                  Text('Voir les détails',
+                    style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+                  Spacer(),
+                  Icon(Icons.chevron_right, color: Colors.white38, size: 20),
+                ]),
+              ),
+            ),
+            const SizedBox(height: 10),
+            _buildOpenPositionButton(),
+          ],
         ),
       ),
     );
@@ -1690,7 +1915,7 @@ class _LivePageState extends State<LivePage> {
     } else {
       setState(() {
         _highlightedCheckpoint = number - 1;
-        _waypointsPanelOpen = true;
+        _openPanel = _SidePanel.waypoints;
       });
       // Défilement vers l'item mis en évidence, une fois le volet en place.
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1961,7 +2186,12 @@ class _LivePageState extends State<LivePage> {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: widgets);
   }
 
-  void _showWaypointsBottomSheet(BuildContext context) {
+  /// Feuille « Voir les détails » du panneau mobile : les points de passage, plus
+  /// un bouton « + d'infos » qui déplie le dénivelé et la vitesse (l'équivalent
+  /// du 2e onglet du volet desktop). Replié par défaut : la timeline reste
+  /// l'information de premier plan.
+  void _showDetailsSheet(BuildContext context) {
+    var statsExpanded = false;
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -1969,54 +2199,114 @@ class _LivePageState extends State<LivePage> {
       builder: (_) => DraggableScrollableSheet(
         initialChildSize: 0.45,
         minChildSize: 0.22,
-        maxChildSize: 0.88,
+        maxChildSize: 0.92,
         snap: true,
-        snapSizes: const [0.22, 0.45, 0.88],
-        builder: (ctx, scrollCtrl) => Container(
-          decoration: const BoxDecoration(
-            color: Color(0xFF18181B),
-            borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
-          ),
-          child: Column(children: [
-            const SizedBox(height: 10),
-            Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
-            const SizedBox(height: 12),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Row(children: [
-                const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
-                const SizedBox(width: 6),
-                Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
-                const Spacer(),
-                GestureDetector(
-                  onTap: () => Navigator.pop(ctx),
-                  child: Container(
-                    width: 28, height: 28,
-                    decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
-                    child: const Icon(Icons.close, color: Colors.white60, size: 15),
+        snapSizes: const [0.22, 0.45, 0.92],
+        builder: (ctx, scrollCtrl) => StatefulBuilder(
+          builder: (ctx, setSheetState) => Container(
+            decoration: const BoxDecoration(
+              color: Color(0xFF18181B),
+              borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+            ),
+            child: Column(children: [
+              const SizedBox(height: 10),
+              Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Row(children: [
+                  const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
+                  const SizedBox(width: 6),
+                  Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+                  const Spacer(),
+                  GestureDetector(
+                    onTap: () => Navigator.pop(ctx),
+                    child: Container(
+                      width: 28, height: 28,
+                      decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
+                      child: const Icon(Icons.close, color: Colors.white60, size: 15),
+                    ),
+                  ),
+                ]),
+              ),
+              const SizedBox(height: 14),
+              Expanded(
+                child: SingleChildScrollView(
+                  controller: scrollCtrl,
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _buildWaypointTimeline(),
+                      if (!_stats.isEmpty) ...[
+                        const SizedBox(height: 6),
+                        GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () => setSheetState(() => statsExpanded = !statsExpanded),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+                            decoration: BoxDecoration(
+                              color: Colors.white.withValues(alpha: 0.05),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.white12),
+                            ),
+                            child: Row(children: [
+                              const Icon(Icons.insights, color: Color(0xFF4F9CFF), size: 16),
+                              const SizedBox(width: 8),
+                              const Text('+ d\'infos',
+                                style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
+                              const SizedBox(width: 6),
+                              const Text('Dénivelé · Vitesse',
+                                style: TextStyle(color: Colors.white38, fontSize: 12)),
+                              const Spacer(),
+                              Icon(statsExpanded ? Icons.expand_less : Icons.expand_more,
+                                color: Colors.white38, size: 20),
+                            ]),
+                          ),
+                        ),
+                        if (statsExpanded) ...[
+                          const SizedBox(height: 10),
+                          RideStatsSection(stats: _stats, live: !_isFinished),
+                        ],
+                      ],
+                    ],
                   ),
                 ),
-              ]),
-            ),
-            const SizedBox(height: 14),
-            Expanded(
-              child: SingleChildScrollView(
-                controller: scrollCtrl,
-                padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
-                child: _buildWaypointTimeline(),
               ),
-            ),
-          ]),
+            ]),
+          ),
         ),
       ),
     );
   }
 
-  Widget _buildWaypointsTab() {
+  /// Onglets verticaux du bord droit : « Points de passage », puis « Stats »
+  /// juste en dessous. Chacun déplie le même volet glissant, sur son contenu.
+  /// L'onglet Stats disparaît tant qu'il n'y a pas assez de points GPS pour
+  /// calculer quoi que ce soit.
+  Widget _buildSideTabs() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        _buildSideTab(
+          label: 'Points de passage · $_waypointCount',
+          panel: _SidePanel.waypoints,
+        ),
+        if (!_stats.isEmpty) ...[
+          const SizedBox(height: 8),
+          _buildSideTab(label: '+ d\'infos', panel: _SidePanel.stats),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildSideTab({required String label, required _SidePanel panel}) {
     return GestureDetector(
       onTap: () => setState(() {
         _highlightedCheckpoint = null;
-        _waypointsPanelOpen = true;
+        _openPanel = panel;
       }),
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
@@ -2032,7 +2322,7 @@ class _LivePageState extends State<LivePage> {
         child: RotatedBox(
           quarterTurns: 3,
           child: Text(
-            'Points de passage · $_waypointCount',
+            label,
             style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.2),
           ),
         ),
@@ -2040,7 +2330,8 @@ class _LivePageState extends State<LivePage> {
     );
   }
 
-  Widget _buildDesktopWaypointsPanel(double topPadding, double bottomPadding) {
+  Widget _buildDesktopSidePanel(double topPadding, double bottomPadding) {
+    final isStats = _openPanel == _SidePanel.stats;
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF0D0D0D).withValues(alpha: 0.96),
@@ -2052,14 +2343,17 @@ class _LivePageState extends State<LivePage> {
         Padding(
           padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
           child: Row(children: [
-            const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
-            const SizedBox(width: 6),
-            Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+            Text(isStats ? '+ d\'infos' : 'Points de passage',
+                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
+            if (!isStats) ...[
+              const SizedBox(width: 6),
+              Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+            ],
             const Spacer(),
             GestureDetector(
               onTap: () => setState(() {
                 _highlightedCheckpoint = null;
-                _waypointsPanelOpen = false;
+                _openPanel = null;
               }),
               child: Container(
                 width: 28, height: 28,
@@ -2073,7 +2367,9 @@ class _LivePageState extends State<LivePage> {
         Expanded(
           child: SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
-            child: _buildWaypointTimeline(),
+            child: isStats
+                ? RideStatsSection(stats: _stats, live: !_isFinished)
+                : _buildWaypointTimeline(),
           ),
         ),
         Container(height: 1, color: Colors.white12),
@@ -2105,39 +2401,45 @@ class _LivePageState extends State<LivePage> {
           _buildMap(),
           Positioned(
             top: 0, left: 0, right: 0,
-            child: _buildTopOverlay(isMobileLayout, topPadding),
+            child: KeyedSubtree(
+              key: _topOverlayKey,
+              child: _buildTopOverlay(isMobileLayout, topPadding),
+            ),
           ),
           Positioned(
             bottom: 0, left: 0, right: 0,
-            child: isMobileLayout
-                ? Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      // Contrôles carte flottants, alignés au-dessus du panneau
-                      Padding(
-                        padding: const EdgeInsets.only(right: 14, bottom: 10),
-                        child: Align(
-                          alignment: Alignment.centerRight,
-                          child: _buildMobileMapControls(),
+            child: KeyedSubtree(
+              key: _bottomOverlayKey,
+              child: isMobileLayout
+                  ? Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        // Contrôles carte flottants, alignés au-dessus du panneau
+                        Padding(
+                          padding: const EdgeInsets.only(right: 14, bottom: 10),
+                          child: Align(
+                            alignment: Alignment.centerRight,
+                            child: _buildMapControls(),
+                          ),
                         ),
-                      ),
-                      _buildMobileBottomPanel(bottomPadding),
-                    ],
-                  )
-                : _buildDesktopBottomBar(bottomPadding),
+                        _buildMobileBottomPanel(bottomPadding),
+                      ],
+                    )
+                  : _buildDesktopBottomBar(bottomPadding),
+            ),
           ),
-          // Desktop: tab repliable + panel droit
+          // Desktop: onglets repliables + volet droit
           if (!isMobileLayout) ...[
             Positioned(
               right: 0,
               top: topPadding + 80,
               child: IgnorePointer(
-                ignoring: _waypointsPanelOpen,
+                ignoring: _openPanel != null,
                 child: AnimatedOpacity(
                   duration: const Duration(milliseconds: 200),
-                  opacity: _waypointsPanelOpen ? 0.0 : 1.0,
-                  child: _buildWaypointsTab(),
+                  opacity: _openPanel != null ? 0.0 : 1.0,
+                  child: _buildSideTabs(),
                 ),
               ),
             ),
@@ -2146,9 +2448,9 @@ class _LivePageState extends State<LivePage> {
               curve: Curves.easeInOut,
               top: 0,
               bottom: 0,
-              right: _waypointsPanelOpen ? 0 : -340,
+              right: _openPanel != null ? 0 : -340,
               width: 340,
-              child: _buildDesktopWaypointsPanel(topPadding, bottomPadding),
+              child: _buildDesktopSidePanel(topPadding, bottomPadding),
             ),
           ],
         ],
