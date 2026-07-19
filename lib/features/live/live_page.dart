@@ -91,6 +91,11 @@ class _LivePageState extends State<LivePage> {
   List<Map<String, dynamic>> tracePositions = [];
   List<Map<String, dynamic>> _rideJsonPoints = [];
 
+  /// Décalage GPS ↔ niveau de la mer, calculé par l'app et transmis dans
+  /// `ride_json`. Nul tant que la sortie n'est pas terminée : pendant le direct,
+  /// les altitudes restent brutes des deux côtés, donc cohérentes.
+  double? _altitudeOffsetMeters;
+
   double _totalDistanceMeters = 0;
   Duration _rideDuration = Duration.zero;
   DateTime? rideStartTime;
@@ -129,10 +134,14 @@ class _LivePageState extends State<LivePage> {
   final GlobalKey _refreshBtnKey = GlobalKey();
   OverlayEntry? _refreshMenuEntry;
 
-  // Overlays posés sur la carte : leur hauteur réelle sert de marge au cadrage
+  // Overlays posés sur la carte : leur géométrie réelle sert de marge au cadrage
   // du tracé, pour qu'il ne passe pas dessous.
   final GlobalKey _topOverlayKey = GlobalKey();
   final GlobalKey _bottomOverlayKey = GlobalKey();
+  // Blocs ancrés en bas à droite en desktop (contrôles carte + carte position) :
+  // on mesure leur bord gauche pour savoir quelle colonne de droite est occupée.
+  final GlobalKey _desktopControlsKey = GlobalKey();
+  final GlobalKey _desktopCardKey = GlobalKey();
 
   @override
   void initState() {
@@ -415,6 +424,7 @@ class _LivePageState extends State<LivePage> {
       samples,
       distanceMeters: _totalDistanceMeters,
       duration: _rideDuration,
+      altitudeOffsetMeters: _altitudeOffsetMeters,
     );
   }
 
@@ -442,23 +452,58 @@ class _LivePageState extends State<LivePage> {
     return box.size.height;
   }
 
-  /// Marges du cadrage : la carte occupe tout l'écran, mais le bandeau du haut,
-  /// le panneau du bas et le volet droit la recouvrent. On les déduit de la zone
-  /// utile pour que le tracé rentre entièrement dans ce qui reste visible.
+  /// Abscisse du bord gauche d'un bloc posé sur la carte, ou null s'il n'est pas
+  /// (encore) affiché.
+  double? _blockLeftEdge(GlobalKey key) {
+    final box = key.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return null;
+    return box.localToGlobal(Offset.zero).dx;
+  }
+
+  /// Zones libres candidates pour cadrer le tracé, exprimées en marges à retirer
+  /// de la carte (qui occupe tout l'écran, les panneaux la recouvrant).
+  ///
+  /// En mobile les panneaux sont des bandeaux pleine largeur : la seule zone
+  /// libre est la bande horizontale entre les deux. En desktop ils sont ancrés
+  /// dans les coins (carte position + contrôles en bas à droite, volet à
+  /// droite) : réserver la hauteur du bloc bas sur *toute* la largeur ampute la
+  /// carte de moitié pour rien. On propose donc aussi une zone « pleine hauteur,
+  /// colonne de droite réservée », et [_fitBounds] garde celle qui permet le
+  /// plus gros zoom — c'est-à-dire celle dont le rapport de forme colle le mieux
+  /// au tracé (bande large pour un tracé étiré, colonne haute pour un tracé
+  /// compact ou vertical).
+  ///
   /// Chaque marge est bornée pour ne jamais dévorer la carte (sinon le fit
   /// renvoie un zoom aberrant).
-  EdgeInsets _mapFitPadding() {
+  List<EdgeInsets> _mapFitCandidates() {
+    const margin = 24.0;
     final size = MediaQuery.sizeOf(context);
     final isMobileLayout = size.width < 900;
     final top = _overlayHeight(_topOverlayKey).clamp(0.0, size.height * 0.30);
     final bottom = _overlayHeight(_bottomOverlayKey).clamp(0.0, size.height * 0.50);
-    final right = (!isMobileLayout && _openPanel != null) ? 340.0 : 0.0;
-    return EdgeInsets.fromLTRB(
-      24,
+    // Le volet droit est opaque et pleine hauteur : il est toujours à exclure.
+    final panel = (!isMobileLayout && _openPanel != null) ? 340.0 : 0.0;
+
+    final horizontalBand = EdgeInsets.fromLTRB(
+      margin,
       top + 16,
-      right.clamp(0.0, size.width * 0.40) + 24,
+      panel.clamp(0.0, size.width * 0.40) + margin,
       bottom + 16,
     );
+    if (isMobileLayout) return [horizontalBand];
+
+    // Colonne de droite réellement occupée : bord gauche du bloc le plus large
+    // (carte position ou contrôles carte, le volet étant déjà à leur droite).
+    final edges = [_blockLeftEdge(_desktopCardKey), _blockLeftEdge(_desktopControlsKey)]
+        .whereType<double>();
+    if (edges.isEmpty) return [horizontalBand];
+    final rightColumn = (size.width - edges.reduce(math.min) + margin)
+        .clamp(0.0, size.width * 0.55);
+
+    return [
+      horizontalBand,
+      EdgeInsets.fromLTRB(margin, top + 16, rightColumn, margin),
+    ];
   }
 
   /// Ajuste la caméra aux points. Renvoie true si un vrai fit a eu lieu
@@ -477,21 +522,27 @@ class _LivePageState extends State<LivePage> {
       return true; // positionné correctement, inutile de réessayer
     }
     final bounds = LatLngBounds.fromPoints(points);
-    try {
-      mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: _mapFitPadding()));
-      // Si le fit s'est produit avant que la carte ait une taille valide, le
-      // zoom résultant peut être infini/NaN et fait planter la TileLayer au
-      // rendu. On corrige alors par un recentrage à zoom fixe.
-      final z = mapController.camera.zoom;
-      if (!z.isFinite) {
-        _safeMove(points.first, 15);
-        return false;
+    // On simule le cadrage dans chaque zone libre candidate (fit() ne bouge pas
+    // la caméra, il renvoie celle qu'il faudrait) et on applique la meilleure.
+    // Un zoom non fini = carte pas encore dimensionnée (timing web) : on écarte
+    // le candidat, sinon la TileLayer plante au rendu.
+    MapCamera? best;
+    for (final padding in _mapFitCandidates()) {
+      try {
+        final cam = CameraFit.bounds(bounds: bounds, padding: padding)
+            .fit(mapController.camera);
+        if (!cam.zoom.isFinite) continue;
+        if (best == null || cam.zoom > best.zoom) best = cam;
+      } catch (_) {
+        // candidat ignoré
       }
-      return true;
-    } catch (_) {
+    }
+    if (best == null) {
       _safeMove(points.first, 15);
       return false;
     }
+    _safeMove(best.center, best.zoom);
+    return true;
   }
 
   void _safeMove(LatLng center, double zoom) {
@@ -618,6 +669,8 @@ class _LivePageState extends State<LivePage> {
         if (rawPoints != null) {
           parsedRideJsonPoints = rawPoints.whereType<Map<String, dynamic>>().toList();
         }
+        _altitudeOffsetMeters =
+            (rideJson?['altitudeOffsetMeters'] as num?)?.toDouble();
       } catch (_) {}
       _rideJsonPoints = parsedRideJsonPoints;
       // Ride terminé : lire les stats authoritatives depuis ride_json
@@ -981,7 +1034,10 @@ class _LivePageState extends State<LivePage> {
                   child: const Icon(Icons.play_arrow, color: Colors.white, size: 16),
                 ),
               ),
-            if (points.length > 1)
+            // Arrivée (pin damier) : uniquement sur un ride terminé. Tant que le
+            // ride tourne, la dernière position n'est pas une arrivée — seul le
+            // point rouge de position courante la marque.
+            if (_isFinished && points.length > 1)
               Marker(
                 point: points.last, width: 26, height: 26,
                 child: Container(
@@ -1429,11 +1485,12 @@ class _LivePageState extends State<LivePage> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          _buildMapControls(),
+          KeyedSubtree(key: _desktopControlsKey, child: _buildMapControls()),
           const SizedBox(height: 10),
           // Le volet droit embarque déjà la carte position : on ne la duplique pas.
           if (_openPanel == null)
             SizedBox(
+              key: _desktopCardKey,
               width: 560,
               child: _buildPositionCard(),
             ),

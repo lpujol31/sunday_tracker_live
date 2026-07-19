@@ -3,6 +3,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
+import 'elevation_stats.dart';
+
 /// Statistiques dérivées d'un ride, recalculées côté web.
 ///
 /// L'app mobile calcule D+, D−, vitesse max et temps en mouvement pendant la
@@ -72,11 +74,6 @@ class RideStats {
   /// ne compte ni en mouvement ni à l'arrêt (le tracking était coupé).
   static const Duration _kPauseGap = Duration(seconds: 60);
 
-  /// Seuil de variation d'altitude retenu pour le cumul D+/D− — identique à celui
-  /// du mobile (`_updateSpeedAndElevation`), pour que les deux affichent le même
-  /// dénivelé sur la même sortie.
-  static const double _kElevThresholdM = 0.5;
-
   /// En-deçà, on considère l'utilisateur à l'arrêt (bruit GPS résiduel).
   static const double _kMovingThresholdKmh = 1.0;
 
@@ -87,28 +84,32 @@ class RideStats {
   /// [distanceMeters] / [duration] sont les valeurs déjà affichées par la page :
   /// on en dérive la vitesse moyenne plutôt que de la recalculer, pour qu'elle
   /// reste cohérente avec la distance et la durée montrées juste à côté.
+  /// [altitudeOffsetMeters] : décalage GPS ↔ niveau de la mer établi par l'app à
+  /// la sauvegarde (le GPS mesure au-dessus de l'ellipsoïde WGS84, ~50 m trop
+  /// haut en Ariège). Sans lui, le live afficherait des altitudes différentes de
+  /// celles du téléphone pour la même sortie.
   factory RideStats.fromSamples(
     List<RideSample> samples, {
     required double distanceMeters,
     required Duration duration,
+    double? altitudeOffsetMeters,
   }) {
     if (samples.length < 2) return empty;
 
-    final alts = <double>[];
-    var dPlus = 0.0;
-    var dMinus = 0.0;
-    double? prevAlt;
+    // Dénivelé : exactement la même chaîne de filtrage que le mobile
+    // (elevation_stats.dart, copie miroir). Cumuler les altitudes brutes point à
+    // point transformait le bruit GPS en dénivelé — un col de 990 m rendait
+    // +2796 m de D+. Le profil tracé est la série filtrée, pas les mesures.
+    final elevSamples = <ElevationSample>[];
     for (final s in samples) {
       final alt = s.altitude;
-      if (alt == null) continue;
-      alts.add(alt);
-      if (prevAlt != null) {
-        final dAlt = alt - prevAlt;
-        if (dAlt > _kElevThresholdM) dPlus += dAlt;
-        if (dAlt < -_kElevThresholdM) dMinus += -dAlt;
-      }
-      prevAlt = alt;
+      final t = s.time;
+      if (alt == null || t == null) continue;
+      elevSamples.add(ElevationSample(t, alt));
     }
+    final elev =
+        computeElevationStats(elevSamples).shifted(altitudeOffsetMeters);
+    final alts = elev.smoothed;
 
     final speeds = <double>[];
     var moving = Duration.zero;
@@ -138,10 +139,10 @@ class RideStats {
 
     return RideStats(
       altProfile: alts,
-      dPlus: dPlus,
-      dMinus: dMinus,
-      altStart: alts.isNotEmpty ? alts.first : null,
-      altEnd: alts.isNotEmpty ? alts.last : null,
+      dPlus: elev.gain,
+      dMinus: elev.loss,
+      altStart: elev.altStart,
+      altEnd: elev.altEnd,
       speedProfile: speeds,
       avgSpeedKmh: avgSpeedKmh,
       movingTime: moving,
