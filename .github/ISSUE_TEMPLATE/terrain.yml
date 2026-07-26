@@ -1,0 +1,58 @@
+name: "📡 Retour live"
+description: "Corrections / ajustements notés en consultant une sortie partagée (web)"
+title: "[Live] "
+labels: ["live"]
+body:
+  - type: dropdown
+    id: categorie
+    attributes:
+      label: Catégorie
+      description: Pour trier au retour au PC
+      options:
+        - carte
+        - trace / suivi temps réel
+        - altitude
+        - stats
+        - waypoints / points mémorisés
+        - partage / lien
+        - auth / compte
+        - perf / chargement
+        - UI / ergonomie
+        - crash / bug
+        - autre
+    validations:
+      required: true
+
+  - type: textarea
+    id: quoi
+    attributes:
+      label: Quoi
+      description: Ce que tu as observé
+      placeholder: "Ex : la position du pilote reste figée alors que la sortie est en cours"
+    validations:
+      required: true
+
+  - type: textarea
+    id: attendu
+    attributes:
+      label: Attendu
+      description: Ce qui aurait dû se passer (optionnel)
+    validations:
+      required: false
+
+  - type: input
+    id: contexte
+    attributes:
+      label: Contexte
+      description: Lien de la sortie / navigateur / heure — repère pour retrouver la trace
+      placeholder: "Ex : lien du 26/07 ~14h30, Chrome mobile, montée du col de Menté"
+    validations:
+      required: false
+
+  - type: textarea
+    id: capture
+    attributes:
+      label: Capture
+      description: Glisse une capture d'écran ou une photo ici (optionnel)
+    validations:
+      required: false

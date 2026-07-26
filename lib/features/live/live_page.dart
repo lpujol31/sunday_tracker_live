@@ -15,6 +15,7 @@ import 'package:google_fonts/google_fonts.dart';
 
 import 'ride_stats.dart';
 import 'stats_section.dart';
+import 'waypoint_kind.dart';
 
 const List<Map<String, dynamic>> kMapStyles = [
   {
@@ -66,6 +67,76 @@ const Duration _kPauseGap = Duration(seconds: 60);
 /// bord droit.
 enum _SidePanel { waypoints, stats }
 
+// ── Marqueur « recherche en cours » de la position courante ───────
+/// Icône location_searching magenta posée à même la trace — pas de pastille
+/// pleine — entourée de deux cercles concentriques qui s'étalent en boucle.
+/// Même marqueur que sur la carte de l'app pendant la sortie.
+class _PulsingPositionMarker extends StatefulWidget {
+  const _PulsingPositionMarker();
+
+  /// Côté du Marker : doit contenir le cercle à son extension maximale.
+  static const double size = 64;
+
+  @override
+  State<_PulsingPositionMarker> createState() => _PulsingPositionMarkerState();
+}
+
+class _PulsingPositionMarkerState extends State<_PulsingPositionMarker>
+    with SingleTickerProviderStateMixin {
+  static const Color _color = Color(0xFFD946EF);
+  static const double _core = 30;
+
+  late final AnimationController _pulse = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 2200),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  /// Un cercle : part du cœur et s'étale jusqu'au bord en s'effaçant.
+  /// [phase] décale le second cercle d'un demi-cycle.
+  Widget _wave(double phase) {
+    return AnimatedBuilder(
+      animation: _pulse,
+      builder: (context, _) {
+        final t = (_pulse.value + phase) % 1.0;
+        final d = _core +
+            (_PulsingPositionMarker.size - _core) * Curves.easeOutCubic.transform(t);
+        final fade = 1 - t;
+        return Container(
+          width: d,
+          height: d,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: _color.withValues(alpha: 0.18 * fade),
+            border: Border.all(color: _color.withValues(alpha: 0.55 * fade), width: 2),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return RepaintBoundary(
+      child: Stack(
+        alignment: Alignment.center,
+        children: [
+          _wave(0),
+          _wave(0.5),
+          // Liseré blanc : l'icône seule se perd sur les tuiles claires.
+          const Icon(Icons.location_searching, color: Colors.white, size: 30),
+          const Icon(Icons.location_searching, color: _color, size: 24),
+        ],
+      ),
+    );
+  }
+}
+
 class LivePage extends StatefulWidget {
   const LivePage({super.key});
 
@@ -83,6 +154,10 @@ class _LivePageState extends State<LivePage> {
   double? latitude;
   double? longitude;
   DateTime? lastUpdate;
+
+  /// Batterie du téléphone relevée sur la position la plus récente qui en porte
+  /// une. Nul pour les sorties d'avant la fonctionnalité (colonne à NULL).
+  int? _batteryLevel;
 
   String appVersion = '';
   String rideStatus = 'unknown';
@@ -609,6 +684,19 @@ class _LivePageState extends State<LivePage> {
     _previousRideStatus = newStatus;
   }
 
+  /// Dernier niveau de batterie connu (positions triées du plus récent au plus
+  /// ancien). La batterie n'est relevée par le téléphone que toutes les 60 s,
+  /// et pas du tout sur les plateformes sans info batterie : on remonte la
+  /// trace jusqu'au premier point renseigné plutôt que d'afficher « — » dès
+  /// que le tout dernier point est vide.
+  int? _latestBatteryLevel(List<Map<String, dynamic>> positions) {
+    for (final p in positions) {
+      final raw = p['battery_level'];
+      if (raw is num) return raw.round().clamp(0, 100);
+    }
+    return null;
+  }
+
   Future<void> loadLastPosition({bool manual = false}) async {
     if (shareCode == null) {
       setState(() { errorMessage = 'missing_code'; isLoading = false; });
@@ -655,6 +743,10 @@ class _LivePageState extends State<LivePage> {
               .whereType<Map<String, dynamic>>()
               .map((w) => {
                     'created_at': w['timestamp'] as String?,
+                    // Heure de reprise d'une pause auto (écrite par l'app) : sert
+                    // à calculer la durée de la pause pour masquer les plus
+                    // courtes sur la carte. Cf. isShortAutoPause.
+                    'resumedAt': w['resumedAt'] as String?,
                     'comment': (w['note'] as String? ?? '').isNotEmpty ? w['note'] : null,
                     // Photos uploadées sur le bucket public `waypoint-photos` : on ne
                     // garde que les URL distantes (les chemins 'local' pointent vers
@@ -662,6 +754,9 @@ class _LivePageState extends State<LivePage> {
                     'photo_urls': _waypointPhotoUrls(w['photos']),
                     'lat': w['lat'],
                     'lng': w['lng'],
+                    // Nature du point (mémorisé / pause / pause auto) : écrite
+                    // par l'app mobile, cf. waypoint_kind.dart.
+                    'kind': w['kind'],
                   })
               .toList();
         }
@@ -696,6 +791,7 @@ class _LivePageState extends State<LivePage> {
         latitude = (latestPosition['latitude'] as num).toDouble();
         longitude = (latestPosition['longitude'] as num).toDouble();
         lastUpdate = DateTime.tryParse(latestPosition['created_at']);
+        _batteryLevel = _latestBatteryLevel(parsedPositions);
         isLoading = false;
         isRefreshing = false;
       });
@@ -934,7 +1030,10 @@ class _LivePageState extends State<LivePage> {
   /// coordonnée (alignment center) et assez grande pour contenir le décalage dans
   /// n'importe quelle direction.
   Marker _waypointMarker(Map cp, int number) {
-    const color = Color(0xFF2563EB); // bleu soutenu, bon contraste avec le blanc
+    // Bleu = point mémorisé, orange = pause au bouton, orange + étincelle =
+    // pause détectée par le mode auto de l'app (cf. WaypointKind).
+    final kind = waypointKindOf(cp);
+    final color = kind.color;
     const lead = 30.0;   // longueur du trait de rappel (px écran)
     const box = 120.0;
     const badge = 30.0;  // diamètre de la pastille numérotée
@@ -983,17 +1082,24 @@ class _LivePageState extends State<LivePage> {
                   width: badge, height: badge,
                   alignment: Alignment.center,
                   decoration: BoxDecoration(
-                    color: color, shape: BoxShape.circle,
+                    color: color,
+                    shape: BoxShape.circle,
                     border: Border.all(color: Colors.white, width: 2),
                     boxShadow: [
                       BoxShadow(color: Colors.black.withValues(alpha: 0.45), blurRadius: 4),
                     ],
                   ),
-                  child: Text('$number',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: number >= 10 ? 13 : 16,
-                      fontWeight: FontWeight.w800, height: 1),
+                  // Étincelle en haut à droite si le point vient du mode auto.
+                  child: waypointBadgeContent(
+                    kind: kind,
+                    size: badge - 4, // hors bordure
+                    color: Colors.white,
+                    child: Text('$number',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: number >= 10 ? 13 : 16,
+                        fontWeight: FontWeight.w800, height: 1),
+                    ),
                   ),
                 ),
               ),
@@ -1045,17 +1151,28 @@ class _LivePageState extends State<LivePage> {
                   child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
                 ),
               ),
-            // Position courante (point rouge) : uniquement pendant le ride.
-            // Sur un ride terminé, la dernière position EST l'arrivée, déjà
-            // marquée par le pin damier — le point rouge serait redondant.
+            // Position courante (cible magenta pulsée) : uniquement pendant le
+            // ride. Sur un ride terminé, la dernière position EST l'arrivée,
+            // déjà marquée par le pin damier — la cible serait redondante.
+            // #D946EF = couleur intermédiaire du dégradé Départ → Arrivée.
             if (!_isFinished)
-              Marker(point: currentPosition, width: 34, height: 34, child: const Icon(Icons.location_on, color: Colors.red, size: 34)),
+              Marker(
+                point: currentPosition,
+                width: _PulsingPositionMarker.size,
+                height: _PulsingPositionMarker.size,
+                child: _PulsingPositionMarker(),
+              ),
             // Waypoints dessinés en DERNIER (au-dessus de tout). Chaque WP est un
             // pin flottant décalé PERPENDICULAIREMENT à la trace, relié par une
             // fine ligne à un point posé sur sa vraie position GPS. Évite toute
             // superposition avec les markers départ/arrivée. Cf _waypointMarker.
+            // Les pauses auto très courtes sont masquées sur la carte pour la
+            // désencombrer ; elles restent dans le volet « Points de passage »,
+            // d'où la numérotation calée sur l'index de la liste complète.
             for (final (i, cp) in _checkpoints.indexed)
-              if (cp['lat'] != null && cp['lng'] != null)
+              if (cp['lat'] != null &&
+                  cp['lng'] != null &&
+                  !isShortAutoPause(cp))
                 _waypointMarker(cp, i + 1),
           ]),
         ],
@@ -1170,11 +1287,41 @@ class _LivePageState extends State<LivePage> {
   /// Carte Départ / Arrivée / Dernière position : libellé coloré, puis date et
   /// heure sur une seule ligne (la date rétrécit plutôt que de déborder dans le
   /// volet droit, plus étroit).
+  /// Pastille batterie du téléphone, affichée à droite du libellé de la carte
+  /// « Dernière position » : un live qui s'arrête à 4 % s'interprète autrement
+  /// qu'un live qui s'arrête à 80 %.
+  Widget _buildBatteryChip(int level) {
+    final color = level <= 10
+        ? const Color(0xFFEF4444)
+        : level <= 20
+            ? const Color(0xFFFF8A00)
+            : Colors.white54;
+    final icon = level <= 10
+        ? Icons.battery_alert
+        : level <= 30
+            ? Icons.battery_2_bar
+            : level <= 60
+                ? Icons.battery_4_bar
+                : level <= 90
+                    ? Icons.battery_6_bar
+                    : Icons.battery_full;
+    return Tooltip(
+      message: 'Batterie du téléphone : $level %',
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(icon, color: color, size: 12),
+        const SizedBox(width: 3),
+        Text('$level %',
+          style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w700)),
+      ]),
+    );
+  }
+
   Widget _buildEndpointCard({
     required String label,
     required Color color,
     required String date,
     required String time,
+    int? battery,
   }) {
     return Container(
       padding: const EdgeInsets.fromLTRB(11, 8, 11, 9),
@@ -1187,8 +1334,17 @@ class _LivePageState extends State<LivePage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          Text(label.toUpperCase(),
-            style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6)),
+          Row(children: [
+            Flexible(
+              child: Text(label.toUpperCase(),
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6)),
+            ),
+            if (battery != null) ...[
+              const SizedBox(width: 8),
+              _buildBatteryChip(battery),
+            ],
+          ]),
           const SizedBox(height: 5),
           Row(children: [
             Flexible(
@@ -1307,8 +1463,6 @@ class _LivePageState extends State<LivePage> {
           distance,
           const SizedBox(height: 8),
           duree,
-          const SizedBox(height: 10),
-          _buildOpenPositionButton(),
         ]);
       }
       return Row(
@@ -1321,8 +1475,6 @@ class _LivePageState extends State<LivePage> {
               distance,
               const SizedBox(height: 8),
               duree,
-              const SizedBox(height: 8),
-              _buildOpenPositionButton(),
             ]),
           ),
         ],
@@ -1330,23 +1482,32 @@ class _LivePageState extends State<LivePage> {
     });
   }
 
-  Widget _buildOpenPositionButton() {
+  /// Bouton « Ouvrir la position ». Compact par défaut (calé à droite du titre
+  /// dans l'en-tête) ; [fullWidth] le rend pleine largeur pour le panneau mobile,
+  /// où il s'empile sous « Voir les détails ».
+  Widget _buildOpenPositionButton({bool fullWidth = false}) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTap: () => _showNavigationSheet(context),
       child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 9),
+        width: fullWidth ? double.infinity : null,
+        padding: fullWidth
+            ? const EdgeInsets.symmetric(vertical: 9)
+            : const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
         decoration: BoxDecoration(
           gradient: const LinearGradient(colors: [Color(0xFF6D28D9), Color(0xFFB026F0)]),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(fullWidth ? 12 : 10),
         ),
-        child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(Icons.map_outlined, color: Colors.white, size: 16),
-          SizedBox(width: 8),
-          Text('Ouvrir la position',
-            style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
-        ]),
+        child: Row(
+          mainAxisSize: fullWidth ? MainAxisSize.max : MainAxisSize.min,
+          mainAxisAlignment: fullWidth ? MainAxisAlignment.center : MainAxisAlignment.start,
+          children: const [
+            Icon(Icons.map_outlined, color: Colors.white, size: 16),
+            SizedBox(width: 7),
+            Text('Ouvrir la position',
+              style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
+          ],
+        ),
       ),
     );
   }
@@ -1366,13 +1527,14 @@ class _LivePageState extends State<LivePage> {
       )),
     ]);
     final derniere = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _buildEndpointDot(const Color(0xFF6D28D9), Icons.location_on, tail: true),
+      _buildEndpointDot(const Color(0xFFD946EF), Icons.my_location, tail: true),
       const SizedBox(width: 10),
       Expanded(child: _buildEndpointCard(
         label: 'Dernière position',
-        color: const Color(0xFF8B5CF6),
+        color: const Color(0xFFD946EF),
         date: _formatUpdateDateFr(),
         time: lastUpdate != null ? DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()) : '--:--:--',
+        battery: _batteryLevel,
       )),
     ]);
     final distance = _buildMetricCard(
@@ -1412,8 +1574,6 @@ class _LivePageState extends State<LivePage> {
             ]),
           ),
         ],
-        const SizedBox(height: 10),
-        _buildOpenPositionButton(),
       ]);
     });
   }
@@ -1435,22 +1595,31 @@ class _LivePageState extends State<LivePage> {
         ]),
         const SizedBox(height: 6),
         Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-          const Icon(Icons.location_on, color: Colors.red, size: 20),
+          Icon(_isFinished ? Icons.sports_score_sharp : Icons.my_location, color: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF), size: 20),
           const SizedBox(width: 6),
-          Flexible(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              alignment: Alignment.centerLeft,
-              child: Text(_formatSinceLastUpdate(),
-                style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
-            ),
+          // Titre + signal groupés à gauche ; l'Expanded pousse le bouton
+          // « Ouvrir la position » contre le bord droit et laisse le titre
+          // se réduire (FittedBox) quand la place manque en mode direct.
+          Expanded(
+            child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.centerLeft,
+                  child: Text(_formatSinceLastUpdate(),
+                    style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
+                ),
+              ),
+              // Fraîcheur du signal : seule info que les cartes date/heure ne donnent
+              // pas d'un coup d'œil.
+              if (!_isFinished) ...[
+                const SizedBox(width: 8),
+                _buildSignalIndicator(),
+              ],
+            ]),
           ),
-          // Fraîcheur du signal : seule info que les cartes date/heure ne donnent
-          // pas d'un coup d'œil.
-          if (!_isFinished) ...[
-            const SizedBox(width: 8),
-            _buildSignalIndicator(),
-          ],
+          const SizedBox(width: 8),
+          _buildOpenPositionButton(),
         ]),
         const SizedBox(height: 8),
         Container(height: 1, color: Colors.white12),
@@ -1626,8 +1795,8 @@ class _LivePageState extends State<LivePage> {
             child: Padding(
               padding: const EdgeInsets.only(left: 10),
               child: _buildMobileStatColumn(
-                icon: _isFinished ? Icons.sports_score_sharp : Icons.location_on,
-                iconColor: const Color(0xFF8B5CF6),
+                icon: _isFinished ? Icons.sports_score_sharp : Icons.my_location,
+                iconColor: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF),
                 label: _isFinished ? 'Arrivée' : 'Dernière pos.',
                 value: _formatCompactDateTime(lastUpdate),
               ),
@@ -1689,7 +1858,7 @@ class _LivePageState extends State<LivePage> {
             ]),
             const SizedBox(height: 8),
             Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-              const Icon(Icons.location_on, color: Colors.red, size: 20),
+              Icon(_isFinished ? Icons.sports_score_sharp : Icons.my_location, color: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF), size: 20),
               const SizedBox(width: 6),
               Flexible(
                 child: FittedBox(
@@ -1699,6 +1868,12 @@ class _LivePageState extends State<LivePage> {
                     style: const TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.bold, height: 1.1)),
                 ),
               ),
+              // Le bandeau compact n'a pas la place d'une colonne batterie :
+              // la pastille se place ici, à côté de la fraîcheur du signal.
+              if (_batteryLevel != null) ...[
+                const SizedBox(width: 8),
+                _buildBatteryChip(_batteryLevel!),
+              ],
               if (!_isFinished) ...[
                 const SizedBox(width: 8),
                 _buildSignalIndicator(),
@@ -1726,7 +1901,7 @@ class _LivePageState extends State<LivePage> {
               ),
             ),
             const SizedBox(height: 10),
-            _buildOpenPositionButton(),
+            _buildOpenPositionButton(fullWidth: true),
           ],
         ),
       ),
@@ -1989,7 +2164,8 @@ class _LivePageState extends State<LivePage> {
 
   /// Contenu partagé (feuille mobile / dialogue navigateur) des infos d'un point.
   Widget _buildCheckpointDetail(Map cp, int number) {
-    const color = Color(0xFF2563EB);
+    final kind = waypointKindOf(cp);
+    final color = kind.color;
     final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
     String two(int n) => n.toString().padLeft(2, '0');
     final timeStr = dt != null ? '${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}' : '--:--:--';
@@ -2002,13 +2178,21 @@ class _LivePageState extends State<LivePage> {
         Container(
           width: 26, height: 26,
           alignment: Alignment.center,
-          decoration: const BoxDecoration(color: color, shape: BoxShape.circle),
-          child: Text('$number',
-            style: TextStyle(color: Colors.white, fontSize: number >= 10 ? 12 : 14, fontWeight: FontWeight.w800, height: 1)),
+          decoration: BoxDecoration(
+            color: color,
+            shape: BoxShape.circle,
+          ),
+          child: waypointBadgeContent(
+            kind: kind, size: 26, color: Colors.white,
+            child: Text('$number',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: number >= 10 ? 12 : 14, fontWeight: FontWeight.w800, height: 1)),
+          ),
         ),
         const SizedBox(width: 10),
         Expanded(
-          child: Text('Point mémorisé · $timeStr',
+          child: Text('${kind.label} · $timeStr',
             style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white)),
         ),
       ]),
@@ -2068,6 +2252,7 @@ class _LivePageState extends State<LivePage> {
     int? number,
     required bool isLast,
     bool highlighted = false,
+    WaypointKind kind = WaypointKind.memo,
   }) {
     final Color dotColor;
     final Widget dotInner;
@@ -2081,14 +2266,19 @@ class _LivePageState extends State<LivePage> {
         dotInner = const Icon(Icons.sports_score_sharp, color: Colors.white, size: 12);
         break;
       case 'current':
-        dotColor = const Color(0xFF4ADE80);
-        dotInner = const Icon(Icons.location_on, color: Colors.white, size: 12);
+        dotColor = const Color(0xFFD946EF);
+        dotInner = const Icon(Icons.my_location, color: Colors.white, size: 12);
         break;
       default:
+        // Bleu pour tous les points ; étincelle = détectée par l'app
+        // (cf. WaypointKind).
         dotColor = const Color(0xFF3B82F6);
-        dotInner = number != null
-            ? Text('$number', style: TextStyle(color: Colors.white, fontSize: number >= 10 ? 10 : 11, fontWeight: FontWeight.w700, height: 1))
-            : const Icon(Icons.location_on, color: Colors.white, size: 12);
+        dotInner = waypointBadgeContent(
+          kind: kind, size: 22, color: Colors.white,
+          child: number != null
+              ? Text('$number', style: TextStyle(color: Colors.white, fontSize: number >= 10 ? 10 : 11, fontWeight: FontWeight.w700, height: 1))
+              : Icon(kind.isPause ? Icons.pause_rounded : Icons.location_on, color: Colors.white, size: 12),
+        );
     }
     final timeStr = time != null
         ? '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}'
@@ -2141,7 +2331,23 @@ class _LivePageState extends State<LivePage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                   Row(children: [
-                    Expanded(child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700))),
+                    Flexible(child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700))),
+                    // Puce « auto » : dit en toutes lettres ce que l'étincelle
+                    // code graphiquement (pause détectée par l'app).
+                    if (type == 'checkpoint' && kind.badgeLabel != null) ...[
+                      const SizedBox(width: 6),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(color: dotColor, width: 1),
+                        ),
+                        child: Text(kind.badgeLabel!,
+                          style: TextStyle(
+                            fontSize: 9, fontWeight: FontWeight.w700, height: 1.2, color: dotColor)),
+                      ),
+                    ],
+                    const Spacer(),
                     Text(timeStr, style: const TextStyle(color: Colors.white38, fontSize: 11)),
                   ]),
                   if (comment != null && comment.isNotEmpty) ...[
@@ -2218,10 +2424,11 @@ class _LivePageState extends State<LivePage> {
     for (final (i, cp) in _checkpoints.indexed) {
       final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
       final isHighlighted = _highlightedCheckpoint == i;
+      final kind = waypointKindOf(cp);
       widgets.add(KeyedSubtree(
         key: isHighlighted ? _highlightKey : null,
         child: _buildTimelinePoint(
-          type: 'checkpoint', label: 'Point mémorisé', time: dt,
+          type: 'checkpoint', label: kind.label, time: dt, kind: kind,
           comment: cp['comment'] as String?,
           photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
           number: i + 1,
