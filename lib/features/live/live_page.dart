@@ -63,16 +63,20 @@ List<Color> _buildGradientColors(int count) {
 /// pause (le tracking envoie un point toutes les 5 à 15 s).
 const Duration _kPauseGap = Duration(seconds: 60);
 
-/// Contenu du volet latéral desktop, sélectionné par les onglets verticaux du
-/// bord droit.
-enum _SidePanel { waypoints, stats }
+/// Onglets du volet desktop, dans leur ordre d'affichage : le récapitulatif de
+/// la sortie, ses points de passage, puis les statistiques détaillées.
+enum _SidePanel { overview, waypoints, stats }
 
 // ── Marqueur « recherche en cours » de la position courante ───────
 /// Icône location_searching magenta posée à même la trace — pas de pastille
 /// pleine — entourée de deux cercles concentriques qui s'étalent en boucle.
 /// Même marqueur que sur la carte de l'app pendant la sortie.
 class _PulsingPositionMarker extends StatefulWidget {
-  const _PulsingPositionMarker();
+  /// Cap en degrés quand la sortie avance : le cœur devient une flèche orientée.
+  /// null (à l'arrêt) → cœur en icône de recherche GPS.
+  final double? headingDeg;
+
+  const _PulsingPositionMarker({this.headingDeg});
 
   /// Côté du Marker : doit contenir le cercle à son extension maximale.
   static const double size = 64;
@@ -128,10 +132,89 @@ class _PulsingPositionMarkerState extends State<_PulsingPositionMarker>
         children: [
           _wave(0),
           _wave(0.5),
-          // Liseré blanc : l'icône seule se perd sur les tuiles claires.
-          const Icon(Icons.location_searching, color: Colors.white, size: 30),
-          const Icon(Icons.location_searching, color: _color, size: 24),
+          if (widget.headingDeg == null)
+            const Stack(
+              alignment: Alignment.center,
+              children: [
+                // Liseré blanc : l'icône seule se perd sur les tuiles claires.
+                Icon(Icons.location_searching, color: Colors.white, size: 30),
+                Icon(Icons.location_searching, color: _color, size: 24),
+              ],
+            )
+          else
+            Transform.rotate(
+              angle: widget.headingDeg! * math.pi / 180,
+              child: const Stack(
+                alignment: Alignment.center,
+                children: [
+                  // Liseré blanc : la flèche seule se perd sur les tuiles claires.
+                  Icon(Icons.navigation, color: Colors.white, size: 33),
+                  Icon(Icons.navigation, color: _color, size: 26),
+                ],
+              ),
+            ),
         ],
+      ),
+    );
+  }
+}
+
+/// Bouton plat des blocs desktop (« Ouvrir la position », « Voir les détails ») :
+/// pleine largeur de son bloc, souligné au survol — la souris attend un retour
+/// que le tactile n'exige pas.
+class _DesktopFlatButton extends StatefulWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+
+  /// Forme du fond au survol : angles bas du bloc quand le bouton le ferme,
+  /// pastille arrondie quand il est posé au milieu d'un panneau.
+  final BorderRadius borderRadius;
+
+  /// Contour permanent, pour un bouton posé seul au milieu d'un panneau.
+  final BoxBorder? border;
+
+  const _DesktopFlatButton({
+    required this.icon,
+    required this.label,
+    required this.color,
+    required this.onTap,
+    this.borderRadius = const BorderRadius.vertical(bottom: Radius.circular(18)),
+    this.border,
+  });
+
+  @override
+  State<_DesktopFlatButton> createState() => _DesktopFlatButtonState();
+}
+
+class _DesktopFlatButtonState extends State<_DesktopFlatButton> {
+  bool _hover = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 140),
+          padding: const EdgeInsets.symmetric(vertical: 13),
+          decoration: BoxDecoration(
+            color: _hover ? widget.color.withValues(alpha: 0.14) : Colors.transparent,
+            borderRadius: widget.borderRadius,
+            border: widget.border,
+          ),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(widget.icon, color: widget.color, size: 18),
+            const SizedBox(width: 9),
+            Text(widget.label,
+                style: TextStyle(color: widget.color, fontSize: 14.5, fontWeight: FontWeight.w700)),
+          ]),
+        ),
       ),
     );
   }
@@ -150,6 +233,10 @@ class _LivePageState extends State<LivePage> {
   String? errorMessage;
   String? errorDetails;
   bool _errorDetailsExpanded = false;
+  /// Le dernier rafraîchissement de fond a échoué alors qu'on affiche déjà des
+  /// données valides : on ne détruit pas l'écran, on teinte le bouton sync.
+  /// Remis à false dès qu'un chargement aboutit.
+  bool _refreshFailed = false;
 
   double? latitude;
   double? longitude;
@@ -175,15 +262,24 @@ class _LivePageState extends State<LivePage> {
   Duration _rideDuration = Duration.zero;
   DateTime? rideStartTime;
 
+  /// Distance cumulée le long du tracé, horodatée : (instant du point, mètres
+  /// depuis le départ). Construite en même temps que la distance totale, sur la
+  /// même source qu'elle — d'où le « 43,5 km » de l'arrivée qui tombe juste. Sert
+  /// à situer un point de passage dans la sortie (cf. [_distanceAtTime]).
+  List<(DateTime, double)> _distanceMarks = const [];
+
   Timer? _tickerTimer;
   Duration _sinceLastUpdate = Duration.zero;
 
   MapController mapController = MapController();
   int _mapStyleIndex = 0;
-  bool _mapFitDone = false;
+  bool _initialCameraDone = false;
   bool _mapReady = false;
 
-  double _savedZoom = 15.0;
+  /// Zoom de la vue d'ouverture et du bouton « recentrer ».
+  static const double _kDefaultZoom = 15.0;
+
+  double _savedZoom = _kDefaultZoom;
   LatLng? _savedCenter;
 
   Timer? refreshTimer;
@@ -192,13 +288,19 @@ class _LivePageState extends State<LivePage> {
   final shareCode = Uri.base.queryParameters['code'];
 
   List<Map<String, dynamic>> _checkpoints = [];
-  /// Volet latéral desktop ouvert, ou null si replié. Les deux onglets verticaux
-  /// du bord droit partagent le même volet glissant.
-  _SidePanel? _openPanel;
+  /// Onglet affiché par le volet desktop.
+  _SidePanel _openPanel = _SidePanel.overview;
+  /// Volet desktop replié contre le bord droit : la carte reprend toute la
+  /// largeur, une poignée verticale permet de le rouvrir.
+  bool _panelCollapsed = false;
   // Point de passage mis en évidence dans le volet desktop (tap sur sa pastille
   // carte). Index dans _checkpoints ; null = aucun. _highlightKey est attachée à
   // l'item correspondant pour l'y faire défiler automatiquement.
   int? _highlightedCheckpoint;
+  // Même mise en évidence, pour les deux bouts de la trace : 'start' ou 'end'
+  // (l'arrivée, ou la dernière position tant que la sortie tourne). Exclusif de
+  // _highlightedCheckpoint — un seul point est surligné à la fois.
+  String? _highlightedEndpoint;
   final GlobalKey _highlightKey = GlobalKey();
 
   /// Dénivelé et vitesse, recalculés à chaque chargement depuis les points GPS
@@ -213,14 +315,16 @@ class _LivePageState extends State<LivePage> {
   // du tracé, pour qu'il ne passe pas dessous.
   final GlobalKey _topOverlayKey = GlobalKey();
   final GlobalKey _bottomOverlayKey = GlobalKey();
-  // Blocs ancrés en bas à droite en desktop (contrôles carte + carte position) :
-  // on mesure leur bord gauche pour savoir quelle colonne de droite est occupée.
+  // Blocs desktop posés sur la carte : on mesure leurs bords pour savoir quelles
+  // colonnes sont occupées (en-tête et contrôles à gauche, volet à droite).
   final GlobalKey _desktopControlsKey = GlobalKey();
-  final GlobalKey _desktopCardKey = GlobalKey();
+  final GlobalKey _desktopHeaderKey = GlobalKey();
+  final GlobalKey _desktopPanelKey = GlobalKey();
 
   @override
   void initState() {
     super.initState();
+    _stripCacheBustParam();
     loadAppVersion();
     loadLastPosition();
     startAutoRefresh();
@@ -238,42 +342,79 @@ class _LivePageState extends State<LivePage> {
     super.dispose();
   }
 
-  /// Titre du panneau : l'heure du point affiché (arrivée si le ride est
-  /// terminé, dernière position reçue sinon). La fraîcheur du signal reste
-  /// portée par l'indicateur de signal.
-  String _formatSinceLastUpdate() {
-    if (rideStatus == 'unknown' || lastUpdate == null) return 'Position inconnue';
-    final dt = lastUpdate!.toLocal();
-    final hhmm = '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-    return _isFinished ? 'Arrivée à $hhmm' : 'Position actuelle à $hhmm';
-  }
-
-  Widget _buildStatusPill() {
+  /// Pastille de statut du ride. [compact] réduit typo et rembourrage pour le
+  /// bandeau flottant mobile, où elle partage la ligne avec la batterie et le
+  /// signal. [large] est la version desktop posée à côté du titre : fond sombre
+  /// plutôt que teinté, pour tenir à côté d'un titre de 40 px sans crier.
+  Widget _buildStatusPill({bool compact = false, bool large = false, bool mobile = false}) {
     final color = getStatusColor();
     final icon = getStatusIcon();
     final label = _isFinished ? 'Ride terminé'
         : rideStatus == 'in_progress' ? 'Ride en cours'
         : rideStatus == 'paused' ? 'Ride en pause'
         : 'Statut du ride indisponible';
+    if (large) {
+      // Pastille pleine du volet desktop : le statut est l'information la plus
+      // forte de l'onglet, elle porte la couleur en aplat. Sur le jaune de la
+      // pause, le texte passe en sombre — le blanc y serait illisible.
+      final onColor = rideStatus == 'paused' ? const Color(0xFF231705) : Colors.white;
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(12),
+          boxShadow: [BoxShadow(color: color.withValues(alpha: 0.35), blurRadius: 16, offset: const Offset(0, 4))],
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(rideStatus == 'in_progress' ? Icons.directions_bike : icon, color: onColor, size: 18),
+          const SizedBox(width: 10),
+          Text(label,
+            style: TextStyle(color: onColor, fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.1)),
+        ]),
+      );
+    }
+    // [mobile] : même pastille cerclée que la version courte, à la taille des
+    // autres indicateurs de la carte d'état du téléphone.
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      padding: mobile
+          ? const EdgeInsets.symmetric(horizontal: 12, vertical: 6)
+          : compact
+              ? const EdgeInsets.symmetric(horizontal: 8, vertical: 3)
+              : const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.15),
+        color: color.withValues(alpha: mobile ? 0.13 : 0.15),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(color: color.withValues(alpha: 0.5), width: 1),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, color: color, size: 13),
-          const SizedBox(width: 6),
-          Text(label, style: TextStyle(color: color, fontSize: 12, fontWeight: FontWeight.w700)),
+          Icon(icon, color: color, size: compact ? 9 : (mobile ? 14 : 13)),
+          SizedBox(width: compact ? 4 : 6),
+          Text(label,
+              style: TextStyle(
+                color: color,
+                fontSize: compact ? 10 : (mobile ? 13.5 : 12),
+                fontWeight: FontWeight.w700)),
         ],
       ),
     );
   }
 
   bool get _isFinished => rideStatus == 'finished';
+
+  /// Durée totale depuis le départ, pauses comprises — le simple temps écoulé,
+  /// à ne pas confondre avec `_rideDuration` qui, lui, retire les pauses.
+  /// Sortie en cours : jusqu'à maintenant (le ticker d'une seconde la fait
+  /// avancer) ; sortie terminée : jusqu'au dernier point reçu, c.-à-d. l'arrivée.
+  Duration? get _elapsedSinceStart {
+    final start = rideStartTime;
+    if (start == null) return null;
+    final end = _isFinished ? lastUpdate : DateTime.now();
+    if (end == null) return null;
+    final elapsed = end.difference(start);
+    return elapsed.isNegative ? Duration.zero : elapsed;
+  }
 
   void startAutoRefresh() {
     refreshTimer?.cancel();
@@ -355,66 +496,89 @@ class _LivePageState extends State<LivePage> {
     return 'Signal perdu';
   }
 
-  Widget _buildSignalIndicator() {
+  /// [large] : version desktop du volet — barres de réseau plutôt qu'une simple
+  /// pastille, à la taille des autres lignes de l'aperçu.
+  Widget _buildSignalIndicator({bool large = false}) {
     final color = _getSignalColor();
     return Tooltip(
       message: '< 2 min : Signal reçu\n2–5 min : Signal faible\n> 5 min : Signal perdu',
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Container(width: 7, height: 7, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-          const SizedBox(width: 5),
-          Text(_getSignalLabel(), style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w600)),
+          if (large)
+            Icon(Icons.signal_cellular_alt, color: color, size: 18)
+          else
+            Container(
+              width: 7, height: 7,
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+            ),
+          SizedBox(width: large ? 8 : 5),
+          Text(_getSignalLabel(),
+            style: TextStyle(color: color, fontSize: large ? 15 : 10, fontWeight: FontWeight.w600)),
         ],
       ),
     );
   }
 
+  /// Pastille de version, calée au pied du titre desktop. Un clic déplie les
+  /// détails sous le titre (cf. [_buildVersionDetails]) plutôt que dans la
+  /// pastille elle-même, dont la croissance ferait sauter la ligne de titre.
   Widget _buildVersionBadge() {
-    final parts = appVersion.split('+');
-    final version = parts.first;
-    final rawBuild = parts.length > 1 ? parts[1].split(' ').first : '';
-    final build = rawBuild.length == 10
-        ? '${rawBuild.substring(0, 8)}.${rawBuild.substring(8)}'
-        : rawBuild;
-    return GestureDetector(
-      onTap: () => setState(() => _versionExpanded = !_versionExpanded),
-      child: Container(
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.65),
-          borderRadius: BorderRadius.circular(8),
+    final version = appVersion.split('+').first.trim();
+    if (version.isEmpty) return const SizedBox.shrink();
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: () => setState(() => _versionExpanded = !_versionExpanded),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.62),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+          ),
+          child: Text(version,
+              style: const TextStyle(color: Colors.white70, fontSize: 12.5, fontWeight: FontWeight.w700)),
         ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(10, 6, 10, 6),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(version, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
-                  if (_versionExpanded && build.isNotEmpty)
-                    Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 10)),
-                  if (_versionExpanded) ...[
-                    const SizedBox(height: 6),
-                    GestureDetector(
-                      onTap: _forcingUpdate ? null : _forceUpdate,
-                      child: Row(mainAxisSize: MainAxisSize.min, children: [
-                        _forcingUpdate
-                            ? const SizedBox(width: 11, height: 11, child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFFF8A00)))
-                            : const Icon(Icons.refresh, size: 13, color: Color(0xFFFF8A00)),
-                        const SizedBox(width: 5),
-                        Text(_forcingUpdate ? 'Actualisation…' : 'Forcer l\'actualisation de la page',
-                            style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w600)),
-                      ]),
-                    ),
-                  ],
-                ],
-              ),
+      ),
+    );
+  }
+
+  /// Détails de version dépliés sous le titre : numéro de build et actualisation
+  /// forcée. Cette dernière doit rester atteignable même quand la page est figée
+  /// sur une ancienne version — d'où sa présence dans l'en-tête, et non dans le
+  /// menu du bouton sync qui disparaît sur un ride terminé.
+  Widget _buildVersionDetails() {
+    final build = _formattedBuild;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 9, 12, 10),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.62),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (build.isNotEmpty)
+            Text('build $build', style: const TextStyle(color: Colors.white54, fontSize: 11)),
+          const SizedBox(height: 7),
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: _forcingUpdate ? null : _forceUpdate,
+              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                _forcingUpdate
+                    ? const SizedBox(width: 12, height: 12, child: CircularProgressIndicator(strokeWidth: 1.5, color: Color(0xFFFF8A00)))
+                    : const Icon(Icons.refresh, size: 14, color: Color(0xFFFF8A00)),
+                const SizedBox(width: 6),
+                Text(_forcingUpdate ? 'Actualisation…' : 'Forcer l\'actualisation de la page',
+                    style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 11, fontWeight: FontWeight.w600)),
+              ]),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -445,16 +609,81 @@ class _LivePageState extends State<LivePage> {
     return 2 * r * math.asin(math.sqrt(h));
   }
 
+  /// Cap à afficher sur le repère de position (degrés, 0 = nord), ou null si
+  /// l'orientation n'est pas exploitable → pastille cible à la place.
+  ///
+  /// Le live ne reçoit pas le heading GPS du téléphone (absent de
+  /// safety_positions) : on le déduit de la fin du tracé. Comme sur l'app, le
+  /// cap n'a de sens qu'en mouvement, d'où les trois garde-fous : ride en cours,
+  /// signal frais, et un dernier segment assez long (au repos le GPS gigote de
+  /// quelques mètres, ce qui ferait tourner la flèche dans le vide).
+  double? get _markerHeading {
+    if (rideStatus != 'in_progress') return null;
+    // Même seuil que l'indicateur de signal (« Signal reçu » < 2 min) : au-delà
+    // le cap décrit un passé trop lointain pour être affirmé. Un seuil plus
+    // serré rendait la flèche clignotante — le live n'interroge la base que
+    // toutes les 30 s, une position en retard suffisait à l'éteindre.
+    if (lastUpdate == null ||
+        DateTime.now().difference(lastUpdate!) > const Duration(minutes: 2)) {
+      return null;
+    }
+    final points = tracePoints;
+    if (points.length < 2) return null;
+    final to = points.last;
+    // Remonte le tracé jusqu'à trouver un point assez éloigné pour donner une
+    // direction fiable. Fenêtre bornée : au-delà, on décrirait un cap périmé.
+    const minMeters = 15.0;
+    const maxLookBack = 6;
+    LatLng? from;
+    for (int i = points.length - 2;
+        i >= 0 && i >= points.length - 2 - maxLookBack;
+        i--) {
+      if (_haversineMeters(points[i], to) >= minMeters) {
+        from = points[i];
+        break;
+      }
+    }
+    if (from == null) return null;
+    return _bearingDegrees(from, to);
+  }
+
+  /// Cap initial du segment [a] → [b], en degrés depuis le nord (sens horaire).
+  double _bearingDegrees(LatLng a, LatLng b) {
+    final lat1 = a.latitude * math.pi / 180;
+    final lat2 = b.latitude * math.pi / 180;
+    final dLng = (b.longitude - a.longitude) * math.pi / 180;
+    final y = math.sin(dLng) * math.cos(lat2);
+    final x = math.cos(lat1) * math.sin(lat2) -
+        math.sin(lat1) * math.cos(lat2) * math.cos(dLng);
+    return (math.atan2(y, x) * 180 / math.pi + 360) % 360;
+  }
+
   void _computeStats(List<Map<String, dynamic>> positions) {
     // Distance : utilise ride_json.points (dense, toutes les 5m) si dispo, sinon safety_positions (toutes les 15s)
-    final distPoints = (_isFinished && _rideJsonPoints.isNotEmpty)
+    final fromRideJson = _isFinished && _rideJsonPoints.isNotEmpty;
+    final distPoints = fromRideJson
         ? _rideJsonPoints.map((p) => LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble())).toList()
         : positions.reversed.map((p) => LatLng((p['latitude'] as num).toDouble(), (p['longitude'] as num).toDouble())).toList();
+    // Horodatage du même point, au même rang : c'est ce qui permet de dire à
+    // quelle distance du départ se trouve un point de passage. `ts` est la clé
+    // de ride_json (`time`/`timestamp` pour les vieilles sorties).
+    final distTimes = fromRideJson
+        ? _rideJsonPoints
+            .map((p) => DateTime.tryParse('${p['ts'] ?? p['time'] ?? p['timestamp'] ?? ''}')?.toLocal())
+            .toList()
+        : positions.reversed
+            .map((p) => DateTime.tryParse(p['created_at'] ?? '')?.toLocal())
+            .toList();
     double dist = 0;
+    final marks = <(DateTime, double)>[];
+    if (distTimes.isNotEmpty && distTimes.first != null) marks.add((distTimes.first!, 0));
     for (int i = 1; i < distPoints.length; i++) {
       dist += _haversineMeters(distPoints[i - 1], distPoints[i]);
+      final t = distTimes[i];
+      if (t != null) marks.add((t, dist));
     }
     _totalDistanceMeters = dist;
+    _distanceMarks = marks;
     // Durée : somme des intervalles entre positions consécutives, en excluant
     // les trous > _kPauseGap. Pendant une pause le tracking est coupé : aucune
     // position n'est envoyée, ce qui creuse un trou dans les timestamps. Prendre
@@ -505,7 +734,29 @@ class _LivePageState extends State<LivePage> {
 
   String _formatDistance(double meters) {
     if (meters < 1000) return '${meters.toStringAsFixed(0)} m';
-    return '${(meters / 1000).toStringAsFixed(2)} km';
+    return '${(meters / 1000).toStringAsFixed(2).replaceAll('.', ',')} km';
+  }
+
+  /// Distance en une valeur courte, pour les listes : « 8,4 km ».
+  String _formatDistanceShort(double meters) {
+    if (meters < 1000) return '${meters.toStringAsFixed(0)} m';
+    return '${(meters / 1000).toStringAsFixed(1).replaceAll('.', ',')} km';
+  }
+
+  /// Distance parcourue à l'instant [t], lue dans [_distanceMarks] : le dernier
+  /// point du tracé antérieur à [t]. Null si l'instant est inconnu ou tombe hors
+  /// du tracé (sortie sans horodatage exploitable) — l'appelant n'affiche alors
+  /// simplement rien.
+  double? _distanceAtTime(DateTime? t) {
+    if (t == null || _distanceMarks.isEmpty) return null;
+    final target = t.toLocal();
+    if (target.isBefore(_distanceMarks.first.$1)) return null;
+    double? found;
+    for (final (markTime, meters) in _distanceMarks) {
+      if (markTime.isAfter(target)) break;
+      found = meters;
+    }
+    return found;
   }
 
   String _formatDuration(Duration d) {
@@ -513,12 +764,6 @@ class _LivePageState extends State<LivePage> {
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
     return '$h:$m:$s';
-  }
-
-  String _formatStartTime() {
-    if (rideStartTime == null) return '--:--:--';
-    final dt = rideStartTime!.toLocal();
-    return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}:${dt.second.toString().padLeft(2, '0')}';
   }
 
   double _overlayHeight(GlobalKey key) {
@@ -535,18 +780,26 @@ class _LivePageState extends State<LivePage> {
     return box.localToGlobal(Offset.zero).dx;
   }
 
+  /// Abscisse du bord droit d'un bloc posé sur la carte, ou null s'il n'est pas
+  /// (encore) affiché.
+  double? _blockRightEdge(GlobalKey key) {
+    final box = key.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null || !box.hasSize) return null;
+    return box.localToGlobal(Offset.zero).dx + box.size.width;
+  }
+
   /// Zones libres candidates pour cadrer le tracé, exprimées en marges à retirer
   /// de la carte (qui occupe tout l'écran, les panneaux la recouvrant).
   ///
   /// En mobile les panneaux sont des bandeaux pleine largeur : la seule zone
-  /// libre est la bande horizontale entre les deux. En desktop ils sont ancrés
-  /// dans les coins (carte position + contrôles en bas à droite, volet à
-  /// droite) : réserver la hauteur du bloc bas sur *toute* la largeur ampute la
-  /// carte de moitié pour rien. On propose donc aussi une zone « pleine hauteur,
-  /// colonne de droite réservée », et [_fitBounds] garde celle qui permet le
-  /// plus gros zoom — c'est-à-dire celle dont le rapport de forme colle le mieux
-  /// au tracé (bande large pour un tracé étiré, colonne haute pour un tracé
-  /// compact ou vertical).
+  /// libre est la bande horizontale entre les deux. En desktop les blocs sont
+  /// dans les coins (titre en haut à gauche, contrôles en bas à gauche, volet à
+  /// droite) : réserver la hauteur du titre sur *toute* la largeur ampute la
+  /// carte pour rien. On propose donc aussi une zone « pleine hauteur, colonne
+  /// du titre réservée », et [_fitBounds] garde celle qui permet le plus gros
+  /// zoom — c'est-à-dire celle dont le rapport de forme colle le mieux au tracé
+  /// (bande large pour un tracé étiré, colonne haute pour un tracé compact ou
+  /// vertical).
   ///
   /// Chaque marge est bornée pour ne jamais dévorer la carte (sinon le fit
   /// renvoie un zoom aberrant).
@@ -556,28 +809,32 @@ class _LivePageState extends State<LivePage> {
     final isMobileLayout = size.width < 900;
     final top = _overlayHeight(_topOverlayKey).clamp(0.0, size.height * 0.30);
     final bottom = _overlayHeight(_bottomOverlayKey).clamp(0.0, size.height * 0.50);
-    // Le volet droit est opaque et pleine hauteur : il est toujours à exclure.
-    final panel = (!isMobileLayout && _openPanel != null) ? 340.0 : 0.0;
 
-    final horizontalBand = EdgeInsets.fromLTRB(
-      margin,
-      top + 16,
-      panel.clamp(0.0, size.width * 0.40) + margin,
-      bottom + 16,
-    );
-    if (isMobileLayout) return [horizontalBand];
+    if (isMobileLayout) {
+      // Les deux bandeaux mobiles sont pleine largeur (contrôles carte compris,
+      // portés par celui du bas) : la seule zone libre est entre les deux.
+      return [EdgeInsets.fromLTRB(margin, top + 16, margin, bottom + 16)];
+    }
 
-    // Colonne de droite réellement occupée : bord gauche du bloc le plus large
-    // (carte position ou contrôles carte, le volet étant déjà à leur droite).
-    final edges = [_blockLeftEdge(_desktopCardKey), _blockLeftEdge(_desktopControlsKey)]
-        .whereType<double>();
-    if (edges.isEmpty) return [horizontalBand];
-    final rightColumn = (size.width - edges.reduce(math.min) + margin)
+    // Colonne de droite : le volet flottant, replié ou non.
+    final panelLeft = _panelCollapsed ? null : _blockLeftEdge(_desktopPanelKey);
+    final rightColumn = (panelLeft != null ? size.width - panelLeft + margin : margin)
         .clamp(0.0, size.width * 0.55);
+    // Colonne de gauche : les contrôles carte, et l'échelle sous eux.
+    final controlsRight = _blockRightEdge(_desktopControlsKey);
+    final leftColumn = ((controlsRight ?? margin) + margin).clamp(0.0, size.width * 0.20);
 
     return [
-      horizontalBand,
-      EdgeInsets.fromLTRB(margin, top + 16, rightColumn, margin),
+      // Bande entre le titre et le bas de l'écran.
+      EdgeInsets.fromLTRB(leftColumn, top + 16, rightColumn, margin + 24),
+      // Pleine hauteur, la colonne du titre en moins.
+      EdgeInsets.fromLTRB(
+        math.max(leftColumn, ((_blockRightEdge(_desktopHeaderKey) ?? 0) + margin))
+            .clamp(0.0, size.width * 0.45),
+        margin,
+        rightColumn,
+        margin + 24,
+      ),
     ];
   }
 
@@ -593,7 +850,7 @@ class _LivePageState extends State<LivePage> {
     final spanLat = lats.reduce(math.max) - lats.reduce(math.min);
     final spanLng = lngs.reduce(math.max) - lngs.reduce(math.min);
     if (spanLat < 1e-6 && spanLng < 1e-6) {
-      _safeMove(points.first, 15);
+      _moveTo(points.first, _kDefaultZoom);
       return true; // positionné correctement, inutile de réessayer
     }
     final bounds = LatLngBounds.fromPoints(points);
@@ -613,38 +870,43 @@ class _LivePageState extends State<LivePage> {
       }
     }
     if (best == null) {
-      _safeMove(points.first, 15);
+      _moveTo(points.first, _kDefaultZoom);
       return false;
     }
-    _safeMove(best.center, best.zoom);
+    _moveTo(best.center, best.zoom);
     return true;
   }
 
-  void _safeMove(LatLng center, double zoom) {
-    try {
-      mapController.move(center, zoom);
-    } catch (_) {}
-  }
-
-  void _tryInitialFit() {
-    if (!_mapReady || _mapFitDone) return;
-    final points = tracePoints;
-    if (points.isEmpty) return;
-    if (_fitBounds(points)) {
-      _mapFitDone = true;
+  /// Vue d'ouverture : la dernière position connue au zoom [_kDefaultZoom],
+  /// exactement le cadrage du bouton « recentrer ». Ce qu'on veut voir en
+  /// arrivant sur un live, c'est où en est la sortie — pas la forme de tout le
+  /// parcours, qui reste à un clic sur « cadrer le tracé ».
+  void _applyInitialCamera() {
+    if (!_mapReady || _initialCameraDone) return;
+    if (latitude == null || longitude == null) return;
+    if (_moveTo(LatLng(latitude!, longitude!), _kDefaultZoom)) {
+      _initialCameraDone = true;
     } else {
       // Carte pas encore dimensionnée (timing web) : on réessaie au frame suivant.
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) _tryInitialFit();
+        if (mounted) _applyInitialCamera();
       });
+    }
+  }
+
+  /// Déplace la caméra ; `false` si la carte n'est pas encore en état de bouger.
+  bool _moveTo(LatLng center, double zoom) {
+    try {
+      mapController.move(center, zoom);
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
   void _recenter() {
     if (latitude == null || longitude == null) return;
-    try {
-      mapController.move(LatLng(latitude!, longitude!), 15);
-    } catch (_) {}
+    _moveTo(LatLng(latitude!, longitude!), _kDefaultZoom);
   }
 
   void _updateDocumentMeta(String status) {
@@ -697,15 +959,35 @@ class _LivePageState extends State<LivePage> {
     return null;
   }
 
+  /// Appel de l'RPC, avec une seconde tentative quand [allowRetry].
+  ///
+  /// `Failed to fetch` est un échec réseau du navigateur, sans code HTTP :
+  /// micro-coupure Wi-Fi, onglet réveillé après veille, requête avortée…
+  /// Ponctuel par nature, donc une retentative courte l'absorbe presque
+  /// toujours. On ne l'active que sur le chargement initial : pour un poll de
+  /// fond, l'échéance suivante joue déjà ce rôle.
+  Future<dynamic> _fetchLiveSession({required bool allowRetry}) async {
+    final supabase = Supabase.instance.client;
+    final params = {'p_share_code': shareCode!};
+    try {
+      return await supabase.rpc('get_live_session', params: params);
+    } catch (_) {
+      if (!allowRetry) rethrow;
+      await Future.delayed(const Duration(seconds: 2));
+      return await supabase.rpc('get_live_session', params: params);
+    }
+  }
+
   Future<void> loadLastPosition({bool manual = false}) async {
     if (shareCode == null) {
       setState(() { errorMessage = 'missing_code'; isLoading = false; });
       return;
     }
+    final isInitialLoad = tracePositions.isEmpty;
     if (!isLoading) setState(() => isRefreshing = true);
     try {
-      final supabase = Supabase.instance.client;
-      final result = await supabase.rpc('get_live_session', params: {'p_share_code': shareCode!});
+      final result = await _fetchLiveSession(allowRetry: isInitialLoad);
+      if (!mounted) return;
       if (result == null || result['session'] == null) {
         setState(() { errorMessage = 'missing_code'; isLoading = false; isRefreshing = false; });
         return;
@@ -731,8 +1013,13 @@ class _LivePageState extends State<LivePage> {
       rideStartTime = startedAt == null || (firstPointAt != null && firstPointAt.isBefore(startedAt))
           ? firstPointAt
           : startedAt;
-      // Les waypoints sont stockés localement sur le téléphone pendant le ride.
-      // Ils arrivent dans safety_sessions.ride_json['waypoints'] uniquement à la fin.
+      // Les waypoints vivent sur le téléphone et arrivent par
+      // safety_sessions.ride_json['waypoints'], que l'app republie à chaque
+      // modification pendant la sortie (pose, pause, reprise, note, photo).
+      // Pendant le direct, ce ride_json ne contient QUE les waypoints — la
+      // trace passe par safety_positions ; le payload complet (points, stats)
+      // n'est écrit qu'au finish. D'où le garde-fou `_isFinished` partout où on
+      // lit `points` ou les stats de ride_json.
       List<Map<String, dynamic>> parsedCheckpoints = [];
       List<Map<String, dynamic>> parsedRideJsonPoints = [];
       try {
@@ -768,8 +1055,13 @@ class _LivePageState extends State<LivePage> {
             (rideJson?['altitudeOffsetMeters'] as num?)?.toDouble();
       } catch (_) {}
       _rideJsonPoints = parsedRideJsonPoints;
-      // Ride terminé : lire les stats authoritatives depuis ride_json
-      bool statsFromRideJson = false;
+      // Toujours recalculé, même quand ride_json fournit les totaux : c'est ce
+      // parcours du tracé qui produit `_distanceMarks`, seule façon de situer un
+      // point de passage dans la sortie (« au km 12,4 »). Le sauter laissait la
+      // liste des points sans distance sur les sorties terminées.
+      _computeStats(parsedPositions);
+      // Ride terminé : les stats de ride_json font foi et écrasent les valeurs
+      // recalculées (chrono exact de l'app, distance mesurée sur le tracé dense).
       if (newStatus == 'finished') {
         try {
           final rideJson = session['ride_json'] as Map<String, dynamic>?;
@@ -778,11 +1070,9 @@ class _LivePageState extends State<LivePage> {
           if (distM != null && durS != null) {
             _totalDistanceMeters = (distM as num).toDouble();
             _rideDuration = Duration(seconds: (durS as num).toInt());
-            statsFromRideJson = true;
           }
         } catch (_) {}
       }
-      if (!statsFromRideJson) _computeStats(parsedPositions);
       _computeRideStats(parsedPositions);
       final latestPosition = parsedPositions.first;
       setState(() {
@@ -792,32 +1082,58 @@ class _LivePageState extends State<LivePage> {
         longitude = (latestPosition['longitude'] as num).toDouble();
         lastUpdate = DateTime.tryParse(latestPosition['created_at']);
         _batteryLevel = _latestBatteryLevel(parsedPositions);
+        // Un chargement qui aboutit efface l'erreur précédente : le polling
+        // continue de tourner derrière l'écran d'erreur, c'est lui qui remet
+        // l'affichage d'aplomb sans que l'utilisateur ait à taper « Réessayer ».
+        errorMessage = null;
+        errorDetails = null;
+        _refreshFailed = false;
         isLoading = false;
         isRefreshing = false;
       });
       _stopPollingIfFinished();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
-        if (!_mapFitDone) {
-          _tryInitialFit();
+        if (!_initialCameraDone) {
+          _applyInitialCamera();
         } else {
           double z = 15;
           try {
             final current = mapController.camera.zoom;
             if (current.isFinite) z = current;
           } catch (_) {}
-          _safeMove(LatLng(latitude!, longitude!), z);
+          _moveTo(LatLng(latitude!, longitude!), z);
         }
       });
       if (manual) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Position mise à jour'), behavior: SnackBarBehavior.floating, duration: Duration(seconds: 2)));
       }
     } catch (e) {
+      if (!mounted) return;
+      // On a déjà une carte, une trace et des stats à l'écran : un blip réseau
+      // sur un poll de fond ne justifie pas de tout effacer. On garde
+      // l'affichage, on teinte le bouton sync, et l'échéance suivante répare.
+      // Seul un tap explicite mérite un retour immédiat.
+      if (!isInitialLoad) {
+        setState(() { _refreshFailed = true; isRefreshing = false; });
+        if (manual) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('Serveur injoignable — nouvelle tentative automatique'),
+            behavior: SnackBarBehavior.floating,
+            duration: Duration(seconds: 3),
+          ));
+        }
+        return;
+      }
       setState(() { errorMessage = 'system_error'; errorDetails = e.toString(); isLoading = false; isRefreshing = false; });
     }
   }
 
-  /// Menu contextuel de rafraîchissement, ancré à gauche du bouton sync.
+  /// Menu contextuel de rafraîchissement, accolé au bouton sync du côté où il y
+  /// a la place : à sa gauche quand les contrôles sont au bord droit (mobile), à
+  /// sa droite quand ils sont dans le coin bas gauche (desktop). Il se déplie
+  /// vers le haut si le bouton est dans la moitié basse de l'écran, sans quoi il
+  /// sortirait par le bas.
   void _toggleRefreshMenu() {
     if (_refreshMenuEntry != null) {
       _removeRefreshMenu();
@@ -832,8 +1148,21 @@ class _LivePageState extends State<LivePage> {
     final btnPos = btnBox.localToGlobal(Offset.zero, ancestor: overlayBox);
     final overlaySize = overlayBox.size;
     const menuWidth = 240.0;
-    // Aligné à droite du menu = bord gauche du bouton, avec 8px d'écart.
-    final rightInset = overlaySize.width - btnPos.dx + 8;
+    const gap = 8.0;
+    const margin = 12.0;
+
+    // Assez de place à gauche du bouton ? Sinon on ouvre à sa droite.
+    final openOnLeft = btnPos.dx >= menuWidth + gap + margin;
+    final double? right = openOnLeft ? overlaySize.width - btnPos.dx + gap : null;
+    final double? left = openOnLeft ? null : btnPos.dx + btnBox.size.width + gap;
+
+    // Bouton dans la moitié basse : le menu monte depuis son bord bas. Sinon il
+    // descend depuis son bord haut.
+    final anchorFromBottom = btnPos.dy > overlaySize.height / 2;
+    final double? top = anchorFromBottom ? null : math.max(margin, btnPos.dy);
+    final double? bottom = anchorFromBottom
+        ? math.max(margin, overlaySize.height - btnPos.dy - btnBox.size.height)
+        : null;
 
     _refreshMenuEntry = OverlayEntry(
       builder: (_) => Stack(children: [
@@ -845,8 +1174,10 @@ class _LivePageState extends State<LivePage> {
           ),
         ),
         Positioned(
-          right: rightInset,
-          top: btnPos.dy,
+          left: left,
+          right: right,
+          top: top,
+          bottom: bottom,
           width: menuWidth,
           child: TweenAnimationBuilder<double>(
             duration: const Duration(milliseconds: 130),
@@ -854,7 +1185,12 @@ class _LivePageState extends State<LivePage> {
             tween: Tween(begin: 0, end: 1),
             builder: (_, t, child) => Opacity(
               opacity: t,
-              child: Transform.scale(alignment: Alignment.centerRight, scale: 0.96 + 0.04 * t, child: child),
+              child: Transform.scale(
+                // L'agrandissement part du bouton, pas du vide.
+                alignment: openOnLeft ? Alignment.centerRight : Alignment.centerLeft,
+                scale: 0.96 + 0.04 * t,
+                child: child,
+              ),
             ),
             child: _buildRefreshMenuCard(),
           ),
@@ -915,6 +1251,28 @@ class _LivePageState extends State<LivePage> {
                 ),
               ),
           ]),
+          const SizedBox(height: 12),
+          Container(height: 1, color: Colors.white12),
+          const SizedBox(height: 10),
+          // Recharge complète de l'app (et non des seules données) : la sortie de
+          // secours quand la page semble figée sur une ancienne version.
+          GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: _forcingUpdate ? null : () { _removeRefreshMenu(); _forceUpdate(); },
+            child: Row(children: [
+              _forcingUpdate
+                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFFF8A00)))
+                  : const Icon(Icons.autorenew, color: Color(0xFFFF8A00), size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(_forcingUpdate ? 'Actualisation…' : 'Forcer l\'actualisation',
+                  style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 12.5, fontWeight: FontWeight.w600)),
+              ),
+            ]),
+          ),
+          const SizedBox(height: 4),
+          const Text('Recharge l\'app depuis le serveur',
+            style: TextStyle(color: Colors.white38, fontSize: 10.5)),
         ]),
       ),
     );
@@ -1029,6 +1387,42 @@ class _LivePageState extends State<LivePage> {
   /// (pastille numérotée plutôt qu'une goutte). La boîte est centrée sur la
   /// coordonnée (alignment center) et assez grande pour contenir le décalage dans
   /// n'importe quelle direction.
+  /// Côté de la boîte des markers Départ / Arrivée. La pastille visible fait
+  /// [_kEndpointPinSize] ; le reste de la boîte est une marge de clic, la
+  /// pastille seule étant une cible trop fine à la souris.
+  static const double _kEndpointMarkerBox = 44;
+  static const double _kEndpointPinSize = 26;
+
+  /// Pastille Départ / Arrivée posée sur la carte : cliquable comme celles des
+  /// points de passage (elle ouvre les infos du point).
+  Widget _endpointPin({
+    required Color color,
+    required IconData icon,
+    required VoidCallback onTap,
+  }) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        // Sans `opaque`, seul le glyphe de l'icône serait cliquable : un
+        // Container décoré ne se teste pas lui-même, il défère à ses enfants.
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Center(
+          child: Container(
+            width: _kEndpointPinSize,
+            height: _kEndpointPinSize,
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+              boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 8)],
+            ),
+            child: Icon(icon, color: Colors.white, size: 16),
+          ),
+        ),
+      ),
+    );
+  }
+
   Marker _waypointMarker(Map cp, int number) {
     // Bleu = point mémorisé, orange = pause au bouton, orange + étincelle =
     // pause détectée par le mode auto de l'app (cf. WaypointKind).
@@ -1077,6 +1471,8 @@ class _LivePageState extends State<LivePage> {
             child: MouseRegion(
               cursor: SystemMouseCursors.click,
               child: GestureDetector(
+                // Toute la pastille cliquable, pas seulement le chiffre.
+                behavior: HitTestBehavior.opaque,
                 onTap: () => _showCheckpointInfo(cp, number),
                 child: Container(
                   width: badge, height: badge,
@@ -1114,6 +1510,9 @@ class _LivePageState extends State<LivePage> {
     final points = tracePoints;
     final currentPosition = LatLng(latitude!, longitude!);
     final gradientColors = _buildGradientColors(points.length);
+    // Échelle : sous les contrôles carte en desktop. En mobile le bas de l'écran
+    // est déjà pris par les cartes stats.
+    final showScalebar = MediaQuery.sizeOf(context).width >= 900;
     return FlutterMap(
         key: ValueKey('map_$_mapStyleIndex'),
         mapController: mapController,
@@ -1123,7 +1522,7 @@ class _LivePageState extends State<LivePage> {
           onMapReady: () {
             _mapReady = true;
             WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) _tryInitialFit();
+              if (mounted) _applyInitialCamera();
             });
           },
         ),
@@ -1134,10 +1533,12 @@ class _LivePageState extends State<LivePage> {
           MarkerLayer(markers: [
             if (points.isNotEmpty)
               Marker(
-                point: points.first, width: 26, height: 26,
-                child: Container(
-                  decoration: BoxDecoration(color: const Color(0xFFFF8A00), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFFFF8A00).withValues(alpha: 0.6), blurRadius: 8)]),
-                  child: const Icon(Icons.play_arrow, color: Colors.white, size: 16),
+                point: points.first,
+                width: _kEndpointMarkerBox, height: _kEndpointMarkerBox,
+                child: _endpointPin(
+                  color: const Color(0xFFFF8A00),
+                  icon: Icons.play_arrow,
+                  onTap: () => _showEndpointInfo('start'),
                 ),
               ),
             // Arrivée (pin damier) : uniquement sur un ride terminé. Tant que le
@@ -1145,22 +1546,26 @@ class _LivePageState extends State<LivePage> {
             // point rouge de position courante la marque.
             if (_isFinished && points.length > 1)
               Marker(
-                point: points.last, width: 26, height: 26,
-                child: Container(
-                  decoration: BoxDecoration(color: const Color(0xFF6D28D9), shape: BoxShape.circle, boxShadow: [BoxShadow(color: const Color(0xFF6D28D9).withValues(alpha: 0.6), blurRadius: 8)]),
-                  child: const Icon(Icons.sports_score_sharp, color: Colors.white, size: 16),
+                point: points.last,
+                width: _kEndpointMarkerBox, height: _kEndpointMarkerBox,
+                child: _endpointPin(
+                  color: const Color(0xFF6D28D9),
+                  icon: Icons.sports_score_sharp,
+                  onTap: () => _showEndpointInfo('end'),
                 ),
               ),
-            // Position courante (cible magenta pulsée) : uniquement pendant le
+            // Position courante (repère magenta pulsé) : uniquement pendant le
             // ride. Sur un ride terminé, la dernière position EST l'arrivée,
-            // déjà marquée par le pin damier — la cible serait redondante.
+            // déjà marquée par le pin damier — le repère serait redondant.
             // #D946EF = couleur intermédiaire du dégradé Départ → Arrivée.
+            // Flèche orientée quand ça avance, cible à l'arrêt : même repère que
+            // la carte de l'app pendant la sortie (cf. _markerHeading).
             if (!_isFinished)
               Marker(
                 point: currentPosition,
                 width: _PulsingPositionMarker.size,
                 height: _PulsingPositionMarker.size,
-                child: _PulsingPositionMarker(),
+                child: _PulsingPositionMarker(headingDeg: _markerHeading),
               ),
             // Waypoints dessinés en DERNIER (au-dessus de tout). Chaque WP est un
             // pin flottant décalé PERPENDICULAIREMENT à la trace, relié par une
@@ -1175,127 +1580,98 @@ class _LivePageState extends State<LivePage> {
                   !isShortAutoPause(cp))
                 _waypointMarker(cp, i + 1),
           ]),
+          if (showScalebar)
+            Scalebar(
+              alignment: Alignment.bottomLeft,
+              padding: const EdgeInsets.only(left: 24, bottom: 12),
+              lineColor: Colors.white.withValues(alpha: 0.85),
+              strokeWidth: 2,
+              lineHeight: 6,
+              textStyle: TextStyle(
+                color: Colors.white.withValues(alpha: 0.85),
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+                shadows: const [Shadow(color: Colors.black87, blurRadius: 4)],
+              ),
+            ),
         ],
     );
   }
 
-  Widget _buildTopOverlay(bool isMobile, double topPadding) {
+  /// En-tête desktop : le titre et la version, rien d'autre — tout l'état de la
+  /// sortie vit dans le volet de droite. Le mobile a le sien (cf.
+  /// _buildMobileTopOverlay).
+  Widget _buildTopOverlay(double topPadding) {
+    return Stack(children: [
+      // Le voile n'est que décoratif : sans IgnorePointer il avalerait les clics
+      // sur toute la bande haute de la carte (un BoxDecoration se teste
+      // lui-même au pointeur) — la pastille Départ y tombe très souvent.
+      Positioned.fill(child: IgnorePointer(child: _headerScrim())),
+      Padding(
+        padding: EdgeInsets.fromLTRB(24, topPadding + 18, 24, 40),
+        child: Row(children: [
+        Column(
+          // Pastille de version chevauchant le bas de « Live », comme une
+          // signature posée sur le titre. Le décalage est peint, pas mis en
+          // page : le bloc garde une hauteur stable et le titre ne bouge pas
+          // quand les détails de version se déplient.
+          key: _desktopHeaderKey,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Sunday Tracker Live',
+                style: GoogleFonts.robotoCondensed(
+                  color: Colors.white,
+                  fontSize: 40,
+                  height: 1,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.2,
+                  shadows: [const Shadow(color: Colors.black87, blurRadius: 10)],
+                )),
+            Transform.translate(
+              offset: const Offset(8, -10),
+              child: _buildVersionBadge(),
+            ),
+            if (_versionExpanded)
+              Transform.translate(
+                offset: const Offset(0, -6),
+                child: _buildVersionDetails(),
+              ),
+          ],
+        ),
+          const Spacer(),
+        ]),
+      ),
+    ]);
+  }
+
+  /// Voile sombre du haut de l'écran : c'est lui qui rend le titre lisible
+  /// quelles que soient les tuiles dessous. Purement décoratif — à poser dans un
+  /// IgnorePointer, sans quoi il capte les clics de la carte.
+  Widget _headerScrim({double opacity = 0.55}) {
     return Container(
       decoration: BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [Colors.black.withValues(alpha: 0.80), Colors.transparent],
-        ),
-      ),
-      padding: EdgeInsets.fromLTRB(16, topPadding + 12, 12, 28),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text('Sunday Tracker Live',
-                    style: GoogleFonts.robotoCondensed(color: Colors.white, fontSize: isMobile ? 14 : 36, fontWeight: FontWeight.w700, shadows: [const Shadow(color: Colors.black54, blurRadius: 4)])),
-                const SizedBox(height: 6),
-                _buildVersionBadge(),
-              ],
-            ),
-          ),
-          // Le rafraîchissement (manuel + intervalle auto) est géré par le bouton
-          // sync du groupe de contrôles carte, en mobile comme en desktop.
-        ],
-      ),
-    );
-  }
-
-  String _formatUpdateDateFr() {
-    if (lastUpdate == null) return '';
-    final dt = lastUpdate!.toLocal();
-    const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
-                    'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
-    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
-  }
-
-  String _formatStartDateFr() {
-    if (rideStartTime == null) return '--';
-    final dt = rideStartTime!.toLocal();
-    const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
-                    'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
-    return '${dt.day} ${months[dt.month - 1]} ${dt.year}';
-  }
-
-  /// Pastille de départ / arrivée / dernière position : cercle plein avec halo,
-  /// mêmes couleurs que les markers de la carte. `tail` ajoute une courte
-  /// traînée de pointillés sous la pastille (ride en cours, où les deux points
-  /// sont côte à côte et non reliés entre eux).
-  Widget _buildEndpointDot(Color color, IconData icon, {bool tail = false}) {
-    final dot = Container(
-      width: 38, height: 38,
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-        boxShadow: [BoxShadow(color: color.withValues(alpha: 0.6), blurRadius: 12, spreadRadius: 1)],
-      ),
-      child: Icon(icon, color: Colors.white, size: 20),
-    );
-    if (!tail) return dot;
-    return Column(mainAxisSize: MainAxisSize.min, children: [
-      dot,
-      const SizedBox(height: 5),
-      for (var i = 0; i < 3; i++)
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 1.5),
-          child: Container(
-            width: 3, height: 3,
-            decoration: BoxDecoration(
-              color: color.withValues(alpha: 1 - i * 0.25),
-              shape: BoxShape.circle,
-            ),
-          ),
-        ),
-    ]);
-  }
-
-  /// Pointillés reliant la pastille de départ à celle d'arrivée, en dégradé
-  /// orange → violet comme la trace sur la carte.
-  Widget _buildEndpointConnector() {
-    const start = Color(0xFFFF8A00);
-    const end = Color(0xFF6D28D9);
-    return SizedBox(
-      width: 38,
-      child: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: List.generate(3, (i) => Padding(
-            padding: const EdgeInsets.symmetric(vertical: 1.5),
-            child: Container(
-              width: 3, height: 3,
-              decoration: BoxDecoration(
-                color: Color.lerp(start, end, i / 2)!,
-                shape: BoxShape.circle,
-              ),
-            ),
-          )),
+          colors: [Colors.black.withValues(alpha: opacity), Colors.transparent],
         ),
       ),
     );
   }
 
-  /// Carte Départ / Arrivée / Dernière position : libellé coloré, puis date et
-  /// heure sur une seule ligne (la date rétrécit plutôt que de déborder dans le
-  /// volet droit, plus étroit).
-  /// Pastille batterie du téléphone, affichée à droite du libellé de la carte
-  /// « Dernière position » : un live qui s'arrête à 4 % s'interprète autrement
-  /// qu'un live qui s'arrête à 80 %.
-  Widget _buildBatteryChip(int level) {
+  /// Pastille batterie du téléphone : un live qui s'arrête à 4 % s'interprète
+  /// autrement qu'un live qui s'arrête à 80 %. [large] est la version desktop,
+  /// posée dans la carte d'en-tête à côté du signal — d'où le vert franc au lieu
+  /// du blanc effacé quand la charge est bonne.
+  Widget _buildBatteryChip(int level, {bool large = false}) {
     final color = level <= 10
         ? const Color(0xFFEF4444)
         : level <= 20
             ? const Color(0xFFFF8A00)
-            : Colors.white54;
+            : large
+                ? const Color(0xFF4ADE80)
+                : Colors.white54;
     final icon = level <= 10
         ? Icons.battery_alert
         : level <= 30
@@ -1308,601 +1684,676 @@ class _LivePageState extends State<LivePage> {
     return Tooltip(
       message: 'Batterie du téléphone : $level %',
       child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(icon, color: color, size: 12),
-        const SizedBox(width: 3),
+        Icon(icon, color: color, size: large ? 19 : 12),
+        SizedBox(width: large ? 7 : 3),
         Text('$level %',
-          style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w700)),
+          style: TextStyle(color: color, fontSize: large ? 15 : 10, fontWeight: FontWeight.w600)),
       ]),
     );
   }
 
-  Widget _buildEndpointCard({
-    required String label,
-    required Color color,
-    required String date,
-    required String time,
-    int? battery,
-  }) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(11, 8, 11, 9),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Row(children: [
-            Flexible(
-              child: Text(label.toUpperCase(),
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6)),
-            ),
-            if (battery != null) ...[
-              const SizedBox(width: 8),
-              _buildBatteryChip(battery),
-            ],
-          ]),
-          const SizedBox(height: 5),
-          Row(children: [
-            Flexible(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerLeft,
-                child: Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.calendar_today_outlined, color: Colors.white38, size: 12),
-                  const SizedBox(width: 6),
-                  Text(date, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700)),
-                  const SizedBox(width: 10),
-                  const Icon(Icons.access_time, color: Colors.white38, size: 12),
-                  const SizedBox(width: 6),
-                  Text(time, style: const TextStyle(color: Colors.white70, fontSize: 13)),
-                ]),
-              ),
-            ),
-          ]),
-        ],
-      ),
-    );
-  }
+  /// Contrôles carte flottants — même look que l'app mobile (ride en cours /
+  /// détail du ride) : un bloc sombre flouté, boutons collés. Rafraîchir (avec
+  /// son menu : intervalle auto, mise à jour forcée), cadrer le tracé, cycler
+  /// les fonds de carte (Plan → Satellite → Topo, icône du style courant),
+  /// recentrer. Pas de zoom au bouton : molette et pincement s'en chargent.
+  ///
+  /// [compact] : version mobile, plus étroite et plus transparente pour masquer
+  /// le moins de tracé possible.
+  Widget _buildMapControls({bool compact = false}) {
+    final side = compact ? 38.0 : 46.0;
+    final iconSize = compact ? 18.0 : 22.0;
+    final radius = compact ? 13.0 : 16.0;
 
-  /// Carte Distance / Durée : libellé + valeur orange, pastille d'icône à droite.
-  Widget _buildMetricCard({
-    required String label,
-    required String value,
-    required IconData icon,
-  }) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 8, 10, 8),
-      decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
-      ),
-      child: Row(children: [
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-              const SizedBox(height: 1),
-              FittedBox(
-                fit: BoxFit.scaleDown,
-                alignment: Alignment.centerLeft,
-                child: Text(value,
-                  style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 20, fontWeight: FontWeight.bold, height: 1.2)),
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(width: 8),
-        Container(
-          width: 32, height: 32,
-          decoration: BoxDecoration(color: Colors.white.withValues(alpha: 0.07), shape: BoxShape.circle),
-          child: Icon(icon, color: Colors.white54, size: 17),
-        ),
-      ]),
-    );
-  }
-
-  /// Bilan d'un ride terminé : timeline départ → arrivée à gauche, distance /
-  /// durée + bouton à droite. La carte fait 560 px en bas de l'écran desktop ;
-  /// sous 400 px de contenu (volet droit de 340, mobile) les deux colonnes
-  /// s'empilent au lieu de déborder.
-  Widget _buildFinishedSummary() {
-    final timeline = Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(children: [
-          _buildEndpointDot(const Color(0xFFFF8A00), Icons.play_arrow),
-          const SizedBox(width: 10),
-          Expanded(child: _buildEndpointCard(
-            label: 'Départ',
-            color: const Color(0xFFFF8A00),
-            date: _formatStartDateFr(),
-            time: _formatStartTime(),
-          )),
-        ]),
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 4),
-          child: _buildEndpointConnector(),
-        ),
-        Row(children: [
-          _buildEndpointDot(const Color(0xFF6D28D9), Icons.sports_score_sharp),
-          const SizedBox(width: 10),
-          Expanded(child: _buildEndpointCard(
-            label: 'Arrivée',
-            color: const Color(0xFF6D28D9),
-            date: _formatUpdateDateFr(),
-            time: lastUpdate != null ? DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()) : '--:--:--',
-          )),
-        ]),
-      ],
-    );
-
-    final distance = _buildMetricCard(
-      label: 'Distance',
-      value: _formatDistance(_totalDistanceMeters),
-      icon: Icons.add_road,
-    );
-    final duree = _buildMetricCard(
-      label: 'Durée',
-      value: _formatDuration(_rideDuration),
-      icon: Icons.schedule,
-    );
-
-    return LayoutBuilder(builder: (context, constraints) {
-      if (constraints.maxWidth < 400) {
-        return Column(mainAxisSize: MainAxisSize.min, children: [
-          timeline,
-          const SizedBox(height: 8),
-          distance,
-          const SizedBox(height: 8),
-          duree,
-        ]);
-      }
-      return Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(child: timeline),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(mainAxisSize: MainAxisSize.min, children: [
-              distance,
-              const SizedBox(height: 8),
-              duree,
-            ]),
-          ),
-        ],
-      );
-    });
-  }
-
-  /// Bouton « Ouvrir la position ». Compact par défaut (calé à droite du titre
-  /// dans l'en-tête) ; [fullWidth] le rend pleine largeur pour le panneau mobile,
-  /// où il s'empile sous « Voir les détails ».
-  Widget _buildOpenPositionButton({bool fullWidth = false}) {
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTap: () => _showNavigationSheet(context),
-      child: Container(
-        width: fullWidth ? double.infinity : null,
-        padding: fullWidth
-            ? const EdgeInsets.symmetric(vertical: 9)
-            : const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(colors: [Color(0xFF6D28D9), Color(0xFFB026F0)]),
-          borderRadius: BorderRadius.circular(fullWidth ? 12 : 10),
-        ),
-        child: Row(
-          mainAxisSize: fullWidth ? MainAxisSize.max : MainAxisSize.min,
-          mainAxisAlignment: fullWidth ? MainAxisAlignment.center : MainAxisAlignment.start,
-          children: const [
-            Icon(Icons.map_outlined, color: Colors.white, size: 16),
-            SizedBox(width: 7),
-            Text('Ouvrir la position',
-              style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// Ride en cours : départ et dernière position côte à côte (chacun avec sa
-  /// pastille et sa traînée de pointillés, comme les markers de la carte), puis
-  /// distance / durée et le bouton. Sous 400 px de contenu, tout s'empile.
-  Widget _buildLiveSummary() {
-    final depart = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _buildEndpointDot(const Color(0xFFFF8A00), Icons.play_arrow, tail: true),
-      const SizedBox(width: 10),
-      Expanded(child: _buildEndpointCard(
-        label: 'Départ',
-        color: const Color(0xFFFF8A00),
-        date: _formatStartDateFr(),
-        time: _formatStartTime(),
-      )),
-    ]);
-    final derniere = Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      _buildEndpointDot(const Color(0xFFD946EF), Icons.my_location, tail: true),
-      const SizedBox(width: 10),
-      Expanded(child: _buildEndpointCard(
-        label: 'Dernière position',
-        color: const Color(0xFFD946EF),
-        date: _formatUpdateDateFr(),
-        time: lastUpdate != null ? DateFormat('HH:mm:ss').format(lastUpdate!.toLocal()) : '--:--:--',
-        battery: _batteryLevel,
-      )),
-    ]);
-    final distance = _buildMetricCard(
-      label: 'Distance',
-      value: _formatDistance(_totalDistanceMeters),
-      icon: Icons.add_road,
-    );
-    final duree = _buildMetricCard(
-      label: 'Durée',
-      value: _formatDuration(_rideDuration),
-      icon: Icons.schedule,
-    );
-
-    return LayoutBuilder(builder: (context, constraints) {
-      final narrow = constraints.maxWidth < 400;
-      return Column(mainAxisSize: MainAxisSize.min, children: [
-        if (narrow) ...[
-          depart,
-          const SizedBox(height: 8),
-          derniere,
-          const SizedBox(height: 8),
-          distance,
-          const SizedBox(height: 8),
-          duree,
-        ] else ...[
-          Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Expanded(child: depart),
-            const SizedBox(width: 12),
-            Expanded(child: derniere),
-          ]),
-          const SizedBox(height: 8),
-          IntrinsicHeight(
-            child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              Expanded(child: distance),
-              const SizedBox(width: 12),
-              Expanded(child: duree),
-            ]),
-          ),
-        ],
-      ]);
-    });
-  }
-
-  /// Contenu du panneau du ride, dans les deux états : en direct (départ +
-  /// dernière position) ou terminé (bilan départ → arrivée). Partagé par la
-  /// carte flottante desktop et le panneau glissant mobile, qui apportent chacun
-  /// leur propre fond.
-  Widget _buildPositionCardContent() {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Row(children: [
-          Text(_isFinished ? 'DERNIÈRE POSITION CONNUE' : 'POSITION EN DIRECT',
-            style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1.0)),
-          const Spacer(),
-          _buildStatusPill(),
-        ]),
-        const SizedBox(height: 6),
-        Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-          Icon(_isFinished ? Icons.sports_score_sharp : Icons.my_location, color: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF), size: 20),
-          const SizedBox(width: 6),
-          // Titre + signal groupés à gauche ; l'Expanded pousse le bouton
-          // « Ouvrir la position » contre le bord droit et laisse le titre
-          // se réduire (FittedBox) quand la place manque en mode direct.
-          Expanded(
-            child: Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text(_formatSinceLastUpdate(),
-                    style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold, height: 1.1)),
-                ),
-              ),
-              // Fraîcheur du signal : seule info que les cartes date/heure ne donnent
-              // pas d'un coup d'œil.
-              if (!_isFinished) ...[
-                const SizedBox(width: 8),
-                _buildSignalIndicator(),
-              ],
-            ]),
-          ),
-          const SizedBox(width: 8),
-          _buildOpenPositionButton(),
-        ]),
-        const SizedBox(height: 8),
-        Container(height: 1, color: Colors.white12),
-        const SizedBox(height: 10),
-        if (_isFinished) _buildFinishedSummary() else _buildLiveSummary(),
-      ],
-    );
-  }
-
-  Widget _buildPositionCard() {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1B1B1B),
-        borderRadius: BorderRadius.circular(16),
-      ),
-      child: _buildPositionCardContent(),
-    );
-  }
-
-  /// Bas de l'écran desktop : mêmes contrôles carte flottants qu'en mobile,
-  /// empilés au-dessus de l'unique carte « dernière position » (qui embarque
-  /// désormais les stats de la sortie). Quand le volet droit est ouvert, il
-  /// reprend la carte position et les contrôles se décalent pour rester visibles
-  /// à gauche du volet.
-  Widget _buildDesktopBottomBar(double bottomPadding) {
-    return AnimatedPadding(
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeInOut,
-      padding: EdgeInsets.fromLTRB(20, 0, 20 + (_openPanel != null ? 340 : 0), 14 + bottomPadding),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          KeyedSubtree(key: _desktopControlsKey, child: _buildMapControls()),
-          const SizedBox(height: 10),
-          // Le volet droit embarque déjà la carte position : on ne la duplique pas.
-          if (_openPanel == null)
-            SizedBox(
-              key: _desktopCardKey,
-              width: 560,
-              child: _buildPositionCard(),
-            ),
-        ],
-      ),
-    );
-  }
-
-  /// Groupe de contrôles carte flottant, identique en mobile et en desktop —
-  /// même look que l'app mobile (ride en cours / détail du ride) : un seul bloc
-  /// sombre flouté, boutons collés. Le dernier bouton cycle entre les fonds de
-  /// carte (Plan → Satellite → Topo) en affichant l'icône du style courant.
-  Widget _buildMapControls() {
     Widget btn({Key? key, required Widget child, required VoidCallback onTap}) {
-      return GestureDetector(
-        onTap: onTap,
-        child: SizedBox(key: key, width: 46, height: 46, child: Center(child: child)),
+      return MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: onTap,
+          child: SizedBox(key: key, width: side, height: side, child: Center(child: child)),
+        ),
       );
     }
 
-    Widget separator() => Container(height: 1, color: Colors.white.withValues(alpha: 0.09));
-
-    final buttons = <Widget>[];
-    if (!_isFinished) {
-      buttons.add(btn(
-        key: _refreshBtnKey,
-        onTap: _toggleRefreshMenu,
-        child: isRefreshing
-            ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.orange))
-            : const Icon(Icons.sync, color: Colors.white, size: 22),
-      ));
-      buttons.add(separator());
-    }
-    buttons.add(btn(
-      onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
-      child: const Icon(Icons.fit_screen, color: Colors.white, size: 22),
-    ));
-    buttons.add(separator());
-    buttons.add(btn(onTap: _recenter, child: const Icon(Icons.my_location, color: Colors.white, size: 22)));
-    buttons.add(separator());
-    // Cycle de fond de carte — icône du style courant
-    buttons.add(btn(
-      onTap: () => _changeMapStyle((_mapStyleIndex + 1) % kMapStyles.length),
-      child: Icon(kMapStyles[_mapStyleIndex]['icon'] as IconData, color: Colors.white, size: 22),
-    ));
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(16),
-      child: BackdropFilter(
-        filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
-        child: Container(
-          width: 46,
-          decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.70),
-            borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.09)),
-          ),
-          child: Column(mainAxisSize: MainAxisSize.min, children: buttons),
-        ),
-      ),
+    Widget separator() => Container(
+      height: 1,
+      margin: EdgeInsets.symmetric(horizontal: compact ? 7 : 0),
+      color: Colors.white.withValues(alpha: 0.09),
     );
+
+    Widget block(List<Widget> children) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: BackdropFilter(
+          filter: ui.ImageFilter.blur(sigmaX: 12, sigmaY: 12),
+          child: Container(
+            width: side,
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: compact ? 0.52 : 0.70),
+              borderRadius: BorderRadius.circular(radius),
+              border: Border.all(color: Colors.white.withValues(alpha: 0.09)),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: compact ? 0.3 : 0.4),
+                  blurRadius: compact ? 12 : 18,
+                  offset: const Offset(0, 4),
+                ),
+              ],
+            ),
+            child: Column(mainAxisSize: MainAxisSize.min, children: children),
+          ),
+        ),
+      );
+    }
+
+    // Une seule des deux variantes est construite à la fois (mobile OU
+    // desktop) : la clé du bouton sync peut donc être portée par les deux.
+    final sync = btn(
+      key: _refreshBtnKey,
+      onTap: _toggleRefreshMenu,
+      child: isRefreshing
+          ? SizedBox(width: iconSize - 2, height: iconSize - 2, child: const CircularProgressIndicator(strokeWidth: 2, color: Colors.orange))
+          // Dernier poll en échec : la trace affichée date un peu, on le dit
+          // sans masquer la carte pour autant.
+          : Icon(_refreshFailed ? Icons.sync_problem : Icons.sync,
+              color: _refreshFailed ? const Color(0xFFF87171) : Colors.white, size: iconSize),
+    );
+
+    return block([
+      // Ride terminé : plus rien à rafraîchir, le bouton sync disparaît.
+      if (!_isFinished) ...[sync, separator()],
+      btn(
+        onTap: () { final pts = tracePoints; if (pts.isNotEmpty) _fitBounds(pts); },
+        child: Icon(Icons.fit_screen, color: Colors.white, size: iconSize),
+      ),
+      separator(),
+      // Cycle de fond de carte — icône du style courant
+      btn(
+        onTap: () => _changeMapStyle((_mapStyleIndex + 1) % kMapStyles.length),
+        child: Icon(kMapStyles[_mapStyleIndex]['icon'] as IconData, color: Colors.white, size: iconSize),
+      ),
+      separator(),
+      btn(onTap: _recenter, child: Icon(Icons.my_location, color: Colors.white, size: iconSize)),
+    ]);
   }
 
-  /// Date + heure compactes, sans l'année : « 11 juil. 23:51 ». Les colonnes du
-  /// bandeau mobile sont trop étroites pour la date complète.
-  String _formatCompactDateTime(DateTime? dt) {
+  /// Date complète : « 27 juil. 2026 ». Le volet desktop est assez large pour
+  /// l'année, contrairement aux blocs flottants mobiles.
+  String _formatLongDateFr(DateTime? dt) {
     if (dt == null) return '--';
     const months = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin',
                     'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
     final l = dt.toLocal();
-    final h = '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
-    return '${l.day} ${months[l.month - 1]} $h';
+    return '${l.day} ${months[l.month - 1]} ${l.year}';
   }
 
-  /// Une colonne du bandeau compact mobile : icône + libellé, puis la valeur.
-  Widget _buildMobileStatColumn({
+  /// Heure à la seconde : sur un direct, la seconde dit si le point vient
+  /// d'arriver.
+  String _formatHms(DateTime? dt) {
+    if (dt == null) return '--:--:--';
+    final l = dt.toLocal();
+    return '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}:${l.second.toString().padLeft(2, '0')}';
+  }
+
+  // ── Interface mobile : la carte d'abord ───────────────────────────────────
+  // Plus de grand panneau noir en bas : uniquement des blocs flottants posés sur
+  // la carte (bandeau d'état sous le titre, quatre cartes stats et deux boutons
+  // au-dessus du bord bas). Tout le détail part dans la feuille « Voir les
+  // détails » et les contrôles carte dans le menu « … » de l'en-tête.
+
+  /// Bloc flottant translucide : fond sombre semi-transparent, angles arrondis,
+  /// ombre discrète. [blur] n'est activé que pour le bandeau d'état (un
+  /// BackdropFilter par carte coûterait cher sur mobile web).
+  Widget _glassBox({
+    required Widget child,
+    required EdgeInsets padding,
+    double radius = 14,
+    double opacity = 0.62,
+    bool blur = false,
+  }) {
+    final box = Container(
+      padding: padding,
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: opacity),
+        borderRadius: BorderRadius.circular(radius),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withValues(alpha: 0.32), blurRadius: 14, offset: const Offset(0, 4)),
+        ],
+      ),
+      child: child,
+    );
+    if (!blur) return box;
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(radius),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: box,
+      ),
+    );
+  }
+
+  /// Pastille de version, au coin haut droit de l'en-tête mobile. Un tap ouvre les détails
+  /// (build complet + forçage de mise à jour) : voir [_showVersionSheet].
+  Widget _buildMobileVersionChip() {
+    final version = appVersion.split('+').first.trim();
+    if (version.isEmpty) return const SizedBox.shrink();
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _showVersionSheet,
+      // La zone tactile déborde un peu de la pastille, trop petite au doigt.
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.62),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.12)),
+          ),
+          child: Text(version,
+            style: const TextStyle(color: Colors.white70, fontSize: 11.5, fontWeight: FontWeight.w700)),
+        ),
+      ),
+    );
+  }
+
+  /// En-tête mobile : le titre à gauche, la version au coin haut droit, puis la
+  /// carte d'état. Même partition que le desktop, aux tailles près.
+  Widget _buildMobileTopOverlay(double topPadding) {
+    return Stack(children: [
+      // Cf. _headerScrim : décoratif, donc neutralisé au pointeur — sans quoi il
+      // avalerait les taps sur les markers de la bande haute.
+      Positioned.fill(child: IgnorePointer(child: _headerScrim())),
+      Padding(
+        padding: EdgeInsets.fromLTRB(14, topPadding + 10, 14, 16),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+          // Titre à gauche, version au coin haut droit : la pastille ne mange ni
+          // le titre ni une ligne du bandeau d'état, et le coin droit était de
+          // toute façon vide. L'Expanded pousse la pastille contre la marge.
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(
+                child: Text('Sunday Tracker Live',
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: GoogleFonts.robotoCondensed(
+                    color: Colors.white, fontSize: 27, height: 1, fontWeight: FontWeight.w700,
+                    shadows: [const Shadow(color: Colors.black87, blurRadius: 8)])),
+              ),
+              const SizedBox(width: 8),
+              _buildMobileVersionChip(),
+            ],
+          ),
+          const SizedBox(height: 4),
+          _buildMobilePositionCard(),
+        ]),
+      ),
+    ]);
+  }
+
+  /// Carte d'état mobile : heure du dernier point, statut, batterie et signal,
+  /// puis l'ouverture dans une app de navigation. Reprise de l'aperçu desktop,
+  /// en plus dense.
+  Widget _buildMobilePositionCard() {
+    final accent = _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF);
+    final unknown = rideStatus == 'unknown' || lastUpdate == null;
+
+    final title = Row(children: [
+      Icon(_isFinished ? Icons.sports_score_sharp : Icons.place, color: accent, size: 20),
+      const SizedBox(width: 9),
+      Expanded(
+        child: Text(
+          unknown
+              ? 'Position inconnue'
+              : '${_isFinished ? 'Arrivée' : 'Dernière position connue'} à ${_formatHms(lastUpdate)}',
+          maxLines: 1, overflow: TextOverflow.ellipsis,
+          style: const TextStyle(color: Colors.white, fontSize: 15.5, fontWeight: FontWeight.w600)),
+      ),
+    ]);
+    final indicators = <Widget>[
+      _buildStatusPill(mobile: true),
+      if (_batteryLevel != null) _buildBatteryChip(_batteryLevel!, large: true),
+      if (!_isFinished) _buildSignalIndicator(large: true),
+    ];
+
+    return _glassBox(
+      padding: EdgeInsets.zero,
+      radius: 18,
+      opacity: 0.74,
+      blur: true,
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 11, 12, 11),
+          // L'heure du dernier point est l'information la plus utile de l'écran :
+          // elle garde sa ligne entière. Les indicateurs (statut, batterie,
+          // signal) passent toujours dessous, quitte à prendre deux lignes —
+          // les partager avec le titre le rognait à « Positi… » dès 380 px.
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+            title,
+            const SizedBox(height: 9),
+            Wrap(spacing: 12, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: indicators),
+          ]),
+        ),
+        Container(height: 1, color: Colors.white.withValues(alpha: 0.09)),
+        _buildPanelActionRow(
+          icon: Icons.map_outlined,
+          label: 'Ouvrir la position',
+          onTap: () => _showNavigationSheet(context),
+        ),
+      ]),
+    );
+  }
+
+  /// Ligne d'action pleine largeur d'un panneau : icône, libellé, chevron.
+  Widget _buildPanelActionRow({
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 13, 12, 13),
+        child: Row(children: [
+          Icon(icon, color: Colors.white70, size: 18),
+          const SizedBox(width: 11),
+          Expanded(
+            child: Text(label,
+              maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+          ),
+          const Icon(Icons.chevron_right, color: Colors.white38, size: 20),
+        ]),
+      ),
+    );
+  }
+
+  /// Bas de l'écran mobile : les contrôles carte, puis le panneau à onglets —
+  /// même contenu que le volet desktop (aperçu, points de passage, stats), posé
+  /// à plat en bas de l'écran.
+  Widget _buildMobileBottomOverlay(double bottomPadding) {
+    final maxPanelHeight = MediaQuery.sizeOf(context).height * 0.44;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(12, 0, 12, 10 + bottomPadding),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+        _buildMapControls(compact: true),
+        const SizedBox(height: 12),
+        ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxPanelHeight),
+          child: _glassBox(
+            padding: EdgeInsets.zero,
+            radius: 20,
+            opacity: 0.80,
+            blur: true,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              _buildMobileTabs(),
+              Container(height: 1, color: Colors.white.withValues(alpha: 0.07)),
+              Flexible(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 14),
+                  child: switch (_mobilePanel) {
+                    _SidePanel.overview => _buildMobileOverview(),
+                    _SidePanel.waypoints => _buildMobileWaypointList(),
+                    _SidePanel.stats => RideStatsSection(stats: _stats, live: !_isFinished),
+                  },
+                ),
+              ),
+            ]),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  /// Onglet mobile réellement affichable : « + d'infos » disparaît tant qu'il
+  /// n'y a pas assez de points GPS pour calculer des statistiques.
+  _SidePanel get _mobilePanel =>
+      (_openPanel == _SidePanel.stats && _stats.isEmpty) ? _SidePanel.overview : _openPanel;
+
+  Widget _buildMobileTabs() {
+    final tabs = <(_SidePanel, String)>[
+      (_SidePanel.overview, 'Aperçu'),
+      (_SidePanel.waypoints, 'Points de passage'),
+      if (!_stats.isEmpty) (_SidePanel.stats, "+ d'infos"),
+    ];
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          for (final (panel, label) in tabs)
+            _buildPanelTab(label: label, panel: panel, active: panel == _mobilePanel, compact: true),
+        ],
+      ),
+    );
+  }
+
+  /// Onglet « Aperçu » mobile : les mesures de la sortie en grille 2 × 2.
+  ///
+  /// Première ligne, en gros : ce qu'on vient chercher d'abord sur un direct —
+  /// combien de kilomètres, depuis combien de temps. Seconde ligne, en plus
+  /// petit : le contexte de ces deux chiffres — depuis quelle heure, et quelle
+  /// part de ce temps a réellement été roulée.
+  ///
+  /// L'heure du dernier point n'y figure pas : la carte d'état, juste au-dessus,
+  /// l'annonce déjà (« Position actualisée à … »).
+  Widget _buildMobileOverview() {
+    const blue = Color(0xFF38BDF8);
+    final elapsed = _elapsedSinceStart;
+
+    // IntrinsicHeight : les deux cartes d'une ligne font la même hauteur, même
+    // si l'une des valeurs a dû rétrécir.
+    Widget row(List<Widget> cards) => IntrinsicHeight(
+      child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Expanded(child: cards[0]),
+        const SizedBox(width: 10),
+        Expanded(child: cards[1]),
+      ]),
+    );
+
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      row([
+        _buildOverviewCard(
+          icon: Icons.place,
+          iconColor: blue,
+          label: 'Distance',
+          value: _formatDistance(_totalDistanceMeters),
+          valueColor: blue,
+          hero: true,
+        ),
+        _buildOverviewCard(
+          icon: Icons.timer_outlined,
+          iconColor: blue,
+          label: 'Durée totale',
+          // Sortie sans heure de départ exploitable : la carte garde sa place
+          // dans la grille plutôt que de la laisser béante.
+          value: elapsed == null ? '--:--:--' : _formatDuration(elapsed),
+          valueColor: Colors.white,
+          hero: true,
+        ),
+      ]),
+      const SizedBox(height: 10),
+      row([
+        _buildOverviewCard(
+          icon: Icons.schedule,
+          iconColor: const Color(0xFFFF8A00),
+          label: 'Départ',
+          value: _formatHms(rideStartTime),
+          valueColor: const Color(0xFFFF8A00),
+        ),
+        _buildOverviewCard(
+          icon: Icons.monitor_heart_outlined,
+          iconColor: const Color(0xFF4ADE80),
+          label: 'Mouvement',
+          value: _formatDuration(_rideDuration),
+          valueColor: const Color(0xFF4ADE80),
+        ),
+      ]),
+    ]);
+  }
+
+  /// Carte d'une mesure de l'aperçu mobile : icône dans la couleur de la mesure,
+  /// libellé discret et valeur en gras.
+  ///
+  /// [hero] intervertit l'ordre de lecture — valeur d'abord, en plus gros, puis
+  /// le libellé dessous — pour les deux mesures de la première ligne.
+  Widget _buildOverviewCard({
     required IconData icon,
     required Color iconColor,
     required String label,
     required String value,
-    Color valueColor = Colors.white,
+    required Color valueColor,
+    bool hero = false,
   }) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Row(children: [
-          Icon(icon, size: 13, color: iconColor),
-          const SizedBox(width: 4),
-          Flexible(
-            child: Text(label,
-              style: const TextStyle(color: Colors.white60, fontSize: 11),
-              maxLines: 1, overflow: TextOverflow.ellipsis),
-          ),
-        ]),
-        const SizedBox(height: 5),
-        // La date rétrécit plutôt que de déborder sur les colonnes voisines.
-        FittedBox(
-          fit: BoxFit.scaleDown,
-          alignment: Alignment.centerLeft,
-          child: Text(value,
-            style: TextStyle(color: valueColor, fontSize: 14, fontWeight: FontWeight.w700)),
-        ),
-      ],
+    final labelText = Text(label,
+      maxLines: 1, overflow: TextOverflow.ellipsis,
+      style: const TextStyle(color: Colors.white54, fontSize: 12, fontWeight: FontWeight.w500));
+    // La valeur rétrécit plutôt que de déborder sur la carte voisine.
+    final valueText = FittedBox(
+      fit: BoxFit.scaleDown,
+      alignment: Alignment.centerLeft,
+      child: Text(value,
+        style: TextStyle(
+          color: valueColor, fontSize: hero ? 23 : 17, height: 1.1,
+          fontWeight: FontWeight.w700, letterSpacing: -0.3)),
     );
-  }
-
-  /// Bandeau compact du panneau mobile : Départ / Dernière position (ou Arrivée)
-  /// / Distance / Durée sur une seule ligne. Remplace les quatre cartes empilées
-  /// du desktop, qui mangeaient plus de la moitié de l'écran sur téléphone.
-  Widget _buildMobileSummaryStrip() {
-    Widget divider() => Container(width: 1, color: Colors.white12);
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      padding: const EdgeInsets.fromLTRB(13, 12, 12, 12),
       decoration: BoxDecoration(
-        color: Colors.white.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.white12),
+        color: Colors.white.withValues(alpha: 0.045),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
       ),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // L'icône se cale sur la première ligne de texte et non au milieu de la
+        // carte : cette première ligne n'est pas la même d'une ligne à l'autre
+        // de la grille (la valeur en haut, le libellé en bas).
+        Padding(
+          padding: EdgeInsets.only(top: hero ? 3 : 1),
+          child: Icon(icon, color: iconColor, size: hero ? 20 : 15),
+        ),
+        SizedBox(width: hero ? 9 : 8),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min,
+            children: hero
+              ? [valueText, const SizedBox(height: 3), labelText]
+              : [labelText, const SizedBox(height: 3), valueText]),
+        ),
+      ]),
+    );
+  }
+
+  /// Onglet « Points de passage » mobile : une liste compacte, un tap ouvre la
+  /// fiche du point. Les deux bouts de la trace y figurent aussi, comme dans le
+  /// volet desktop.
+  Widget _buildMobileWaypointList() {
+    if (tracePositions.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 20),
+        child: Text('Aucun point disponible',
+          style: TextStyle(color: Colors.white38, fontSize: 13)),
+      );
+    }
+    // Les lignes se construisent en différé : chacune doit savoir si elle ferme
+    // la chronologie (le fil vertical s'arrête au dernier point), ce qu'on ne
+    // sait qu'une fois la liste complète.
+    final rows = <Widget Function(bool isLast)>[];
+
+    rows.add((isLast) => _buildMobileWaypointRow(
+      color: const Color(0xFFFF8A00),
+      badge: const Icon(Icons.play_arrow, color: Colors.white, size: 15),
+      label: 'Départ',
+      time: _formatHms(rideStartTime),
+      distance: null,
+      isLast: isLast,
+      onTap: () => _showEndpointInfo('start'),
+    ));
+
+    for (final (i, cp) in _checkpoints.indexed) {
+      final kind = waypointKindOf(cp);
+      final dt = DateTime.tryParse(cp['created_at'] ?? '')?.toLocal();
+      final comment = (cp['comment'] as String?)?.trim() ?? '';
+      rows.add((isLast) => _buildMobileWaypointRow(
+        color: kind.color,
+        // Numéro centré, plus l'étincelle quand le point a été posé par l'app :
+        // même vocabulaire que les pins de carte et le volet desktop
+        // (cf. waypointBadgeContent). 24 = diamètre intérieur de la pastille.
+        badge: waypointBadgeContent(
+          kind: kind, size: 24, color: Colors.white,
+          child: Text('${i + 1}',
+            style: TextStyle(
+              color: Colors.white, fontSize: i >= 9 ? 12 : 13,
+              fontWeight: FontWeight.w800, height: 1)),
+        ),
+        // Le nom du point suffit : son numéro est déjà dans la pastille, et sa
+        // nature (posé au doigt ou détecté par l'app) n'apprend rien au lecteur
+        // du live — d'où la disparition des puces « auto ».
+        label: comment.isNotEmpty ? comment : (kind.isPause ? 'Pause' : 'Point de passage'),
+        time: _formatHms(dt),
+        distance: _distanceAtTime(dt),
+        isLast: isLast,
+        onTap: () => _showCheckpointInfo(cp, i + 1),
+      ));
+    }
+
+    if (tracePositions.length > 1 || _isFinished) {
+      rows.add((isLast) => _buildMobileWaypointRow(
+        color: _isFinished ? const Color(0xFF6D28D9) : const Color(0xFFD946EF),
+        badge: Icon(_isFinished ? Icons.sports_score_sharp : Icons.my_location,
+          color: Colors.white, size: 15),
+        label: _isFinished ? 'Arrivée' : 'Dernière position',
+        time: _formatHms(lastUpdate),
+        // Le dernier point ferme le tracé : sa distance est le total de la
+        // sortie, pas une valeur interpolée.
+        distance: _totalDistanceMeters > 0 ? _totalDistanceMeters : null,
+        isLast: isLast,
+        onTap: () => _showEndpointInfo('end'),
+      ));
+    }
+
+    return Column(mainAxisSize: MainAxisSize.min, children: [
+      for (var i = 0; i < rows.length; i++) ...[
+        if (i > 0) Container(height: 1, color: Colors.white.withValues(alpha: 0.06)),
+        rows[i](i == rows.length - 1),
+      ],
+    ]);
+  }
+
+  /// Une ligne de l'onglet mobile : pastille reliée à la suivante par le fil de
+  /// la chronologie, nom du point à gauche, heure et distance depuis le départ
+  /// alignées à droite.
+  Widget _buildMobileWaypointRow({
+    required Color color,
+    required Widget badge,
+    required String label,
+    required String time,
+    required double? distance,
+    required bool isLast,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
       child: IntrinsicHeight(
         child: Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-          Expanded(
-            child: _buildMobileStatColumn(
-              icon: Icons.play_circle,
-              iconColor: const Color(0xFFFF8A00),
-              label: 'Départ',
-              value: _formatCompactDateTime(rideStartTime),
-            ),
+          SizedBox(
+            width: 30,
+            child: Column(children: [
+              Container(
+                width: 28, height: 28,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: color,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.white.withValues(alpha: 0.85), width: 2),
+                ),
+                child: badge,
+              ),
+              // Le fil ne descend pas sous le dernier point : la chronologie
+              // s'arrête là, elle ne pointe pas dans le vide.
+              if (!isLast)
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Container(width: 2, color: Colors.white12),
+                  ),
+                ),
+            ]),
           ),
-          divider(),
+          const SizedBox(width: 11),
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.only(left: 10),
-              child: _buildMobileStatColumn(
-                icon: _isFinished ? Icons.sports_score_sharp : Icons.my_location,
-                iconColor: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF),
-                label: _isFinished ? 'Arrivée' : 'Dernière pos.',
-                value: _formatCompactDateTime(lastUpdate),
-              ),
+              padding: const EdgeInsets.fromLTRB(0, 4, 0, 14),
+              child: Text(label,
+                maxLines: 2, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white, fontSize: 14.5, fontWeight: FontWeight.w700)),
             ),
           ),
-          divider(),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(left: 10),
-              child: _buildMobileStatColumn(
-                icon: Icons.add_road,
-                iconColor: Colors.white54,
-                label: 'Distance',
-                value: _formatDistance(_totalDistanceMeters),
-                valueColor: const Color(0xFFFF8A00),
-              ),
-            ),
-          ),
-          divider(),
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.only(left: 10),
-              child: _buildMobileStatColumn(
-                icon: Icons.schedule,
-                iconColor: Colors.white54,
-                label: 'Durée',
-                value: _formatDuration(_rideDuration),
-                valueColor: const Color(0xFFFF8A00),
-              ),
-            ),
+          const SizedBox(width: 10),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(0, 2, 0, 14),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+              Text(time,
+                style: const TextStyle(color: Colors.white, fontSize: 14.5, fontWeight: FontWeight.w700)),
+              if (distance != null) ...[
+                const SizedBox(height: 2),
+                Text(_formatDistanceShort(distance),
+                  style: const TextStyle(color: Colors.white38, fontSize: 12.5, fontWeight: FontWeight.w500)),
+              ],
+            ]),
           ),
         ]),
       ),
     );
   }
 
-  /// Panneau mobile compact : en-tête position, bandeau des 4 chiffres clés, puis
-  /// deux actions. Tout le reste (points de passage, dénivelé, vitesse) part dans
-  /// la feuille « Voir les détails » — le panneau tient ainsi en bas de l'écran
-  /// sans jamais manger la carte.
-  Widget _buildMobileBottomPanel(double bottomPadding) {
-    return Padding(
-      padding: EdgeInsets.fromLTRB(14, 0, 14, 12 + bottomPadding),
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1B1B1B),
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Text(_isFinished ? 'DERNIÈRE POSITION CONNUE' : 'POSITION EN DIRECT',
-                style: const TextStyle(color: Color(0xFFFF8A00), fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 1.0)),
-              const Spacer(),
-              _buildStatusPill(),
-            ]),
-            const SizedBox(height: 8),
-            Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
-              Icon(_isFinished ? Icons.sports_score_sharp : Icons.my_location, color: _isFinished ? const Color(0xFF8B5CF6) : const Color(0xFFD946EF), size: 20),
-              const SizedBox(width: 6),
-              Flexible(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text(_formatSinceLastUpdate(),
-                    style: const TextStyle(color: Colors.white, fontSize: 19, fontWeight: FontWeight.bold, height: 1.1)),
-                ),
+  /// Numéro de build lisible : `2026072603` → `20260726.03`.
+  String get _formattedBuild {
+    final parts = appVersion.split('+');
+    final raw = parts.length > 1 ? parts[1].split(' ').first : '';
+    return raw.length == 10 ? '${raw.substring(0, 8)}.${raw.substring(8)}' : raw;
+  }
+
+  /// Détails de version, ouverts au tap sur la pastille de l'en-tête mobile :
+  /// build complet et mise à jour forcée. Cette dernière doit rester atteignable
+  /// même quand le bouton sync disparaît (ride terminé) ou que l'app est figée
+  /// sur une ancienne version — d'où sa présence ici, et non dans la barre de
+  /// carte. Les détails du ride ont déjà leur bouton en bas d'écran.
+  void _showVersionSheet() {
+    final build = _formattedBuild;
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF18181B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (sheetCtx) => SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 18),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Center(
+              child: Container(
+                width: 48, height: 4,
+                decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999)),
               ),
-              // Le bandeau compact n'a pas la place d'une colonne batterie :
-              // la pastille se place ici, à côté de la fraîcheur du signal.
-              if (_batteryLevel != null) ...[
-                const SizedBox(width: 8),
-                _buildBatteryChip(_batteryLevel!),
-              ],
-              if (!_isFinished) ...[
-                const SizedBox(width: 8),
-                _buildSignalIndicator(),
-              ],
-            ]),
-            const SizedBox(height: 12),
-            _buildMobileSummaryStrip(),
-            const SizedBox(height: 10),
+            ),
+            const SizedBox(height: 18),
+            Text(appVersion.split('+').first.trim(),
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w700)),
+            if (build.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text('build $build',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+            const SizedBox(height: 18),
             GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: () => _showDetailsSheet(context),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _forceUpdate();
+              },
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.04),
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.white12),
-                ),
-                child: const Row(children: [
-                  Text('Voir les détails',
-                    style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
-                  Spacer(),
-                  Icon(Icons.chevron_right, color: Colors.white38, size: 20),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                decoration: BoxDecoration(color: const Color(0xFF2A2A2A), borderRadius: BorderRadius.circular(10)),
+                child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  Icon(Icons.autorenew, color: Color(0xFFFF8A00), size: 18),
+                  SizedBox(width: 8),
+                  Text('Forcer l\'actualisation de la page',
+                    style: TextStyle(color: Colors.white, fontSize: 13.5, fontWeight: FontWeight.w600)),
                 ]),
               ),
             ),
             const SizedBox(height: 10),
-            _buildOpenPositionButton(fullWidth: true),
-          ],
+            const Text('À utiliser si l\'app semble bloquée sur une ancienne version',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: Colors.white30, fontSize: 11)),
+          ]),
         ),
       ),
     );
@@ -1910,9 +2361,18 @@ class _LivePageState extends State<LivePage> {
 
   bool _forcingUpdate = false;
 
+  /// Paramètre de cache-busting ajouté à l'URL par [_forceUpdate], puis effacé
+  /// de la barre d'adresse au démarrage pour que le lien reste partageable.
+  static const _cacheBustParam = 'fr';
+
   /// Vide le service worker + tous les caches puis recharge la page.
   /// Équivaut à un "hard refresh" mais déclenché par l'utilisateur en un tap,
   /// ce qui est bien plus simple à expliquer (et faisable sur mobile/tablette).
+  ///
+  /// `location.reload()` seul ne suffit pas toujours : Safari iOS notamment
+  /// resert volontiers l'ancien document depuis son cache mémoire. On recharge
+  /// donc vers une URL portant un paramètre unique — impossible à servir depuis
+  /// le cache — via `replace()` pour ne pas empiler d'entrée d'historique.
   Future<void> _forceUpdate() async {
     if (_forcingUpdate) return;
     setState(() => _forcingUpdate = true);
@@ -1934,9 +2394,26 @@ class _LivePageState extends State<LivePage> {
         }
       }
     } catch (_) {}
-    // Recharge la page : le nouveau service worker et les nouveaux assets
-    // seront re-téléchargés depuis le serveur.
-    html.window.location.reload();
+    // Nouvelle URL = URL courante + jeton unique, en conservant le code de ride
+    // et tous les autres paramètres.
+    final uri = Uri.parse(html.window.location.href);
+    final params = Map<String, String>.from(uri.queryParameters)
+      ..[_cacheBustParam] = DateTime.now().millisecondsSinceEpoch.toString();
+    html.window.location.replace(uri.replace(queryParameters: params).toString());
+  }
+
+  /// Retire le jeton de cache-busting de la barre d'adresse (sans recharger) :
+  /// l'utilisateur qui copie le lien après une mise à jour forcée partage une
+  /// URL propre.
+  void _stripCacheBustParam() {
+    try {
+      final uri = Uri.parse(html.window.location.href);
+      if (!uri.queryParameters.containsKey(_cacheBustParam)) return;
+      final params = Map<String, String>.from(uri.queryParameters)
+        ..remove(_cacheBustParam);
+      final cleaned = uri.replace(queryParameters: params.isEmpty ? null : params);
+      html.window.history.replaceState(null, '', cleaned.toString());
+    } catch (_) {}
   }
 
   Widget _buildErrorScreen() {
@@ -2020,13 +2497,6 @@ class _LivePageState extends State<LivePage> {
 
   // ── Waypoints ─────────────────────────────────────────────────────────────
 
-  int get _waypointCount {
-    int n = 0;
-    if (tracePositions.isNotEmpty) n++;
-    n += _checkpoints.length;
-    if (tracePositions.length > 1 || _isFinished) n++;
-    return n;
-  }
 
   /// Extrait les URL publiques Supabase des photos d'un waypoint.
   /// Format mobile : `List<{'local': <chemin téléphone>, 'url': <http public>}>`.
@@ -2122,6 +2592,96 @@ class _LivePageState extends State<LivePage> {
   ///   note, photos, coordonnées), calquée sur l'écran détail du ride mobile.
   /// - Navigateur : ouvre simplement le volet « Points de passage » et fait
   ///   défiler jusqu'au point cliqué, mis en évidence.
+  /// Tap sur la pastille Départ ou Arrivée de la carte : même comportement que
+  /// pour un point de passage — le volet desktop surligne la ligne
+  /// correspondante de la timeline, le mobile ouvre une feuille de détail.
+  /// [which] vaut 'start' ou 'end'.
+  void _showEndpointInfo(String which) {
+    final isMobileLayout = MediaQuery.sizeOf(context).width < 900;
+    if (isMobileLayout) {
+      showModalBottomSheet(
+        context: context,
+        backgroundColor: const Color(0xFF18181B),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+        ),
+        builder: (ctx) => SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 10, 20, 20),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
+              const SizedBox(height: 16),
+              _buildEndpointDetail(which),
+            ]),
+          ),
+        ),
+      );
+      return;
+    }
+    setState(() {
+      _highlightedCheckpoint = null;
+      _highlightedEndpoint = which;
+      _openPanel = _SidePanel.waypoints;
+      _panelCollapsed = false;
+    });
+    _scrollToHighlight();
+  }
+
+  /// Détail d'un bout de trace, pour la feuille mobile : libellé, date et heure
+  /// à la seconde, coordonnées.
+  Widget _buildEndpointDetail(String which) {
+    final isStart = which == 'start';
+    final dt = isStart ? rideStartTime : lastUpdate;
+    final color = isStart
+        ? const Color(0xFFFF8A00)
+        : _isFinished ? const Color(0xFF6D28D9) : const Color(0xFFD946EF);
+    final icon = isStart
+        ? Icons.play_arrow
+        : _isFinished ? Icons.sports_score_sharp : Icons.my_location;
+    final label = isStart ? 'Départ' : (_isFinished ? 'Arrivée' : 'Dernière position');
+    // Le départ est le premier point de la trace, l'autre bout le dernier.
+    final points = tracePoints;
+    final at = points.isEmpty ? null : (isStart ? points.first : points.last);
+
+    return Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        Container(
+          width: 26, height: 26,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          child: Icon(icon, color: Colors.white, size: 15),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text('$label · ${_formatHms(dt)}',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700, color: Colors.white)),
+        ),
+      ]),
+      const SizedBox(height: 12),
+      Text(_formatLongDateFr(dt), style: const TextStyle(fontSize: 15, color: Colors.white70, height: 1.4)),
+      if (at != null) ...[
+        const SizedBox(height: 16),
+        Text('Lat ${at.latitude.toStringAsFixed(6)}  ·  Long ${at.longitude.toStringAsFixed(6)}',
+          style: const TextStyle(fontSize: 12, color: Colors.white38)),
+      ],
+    ]);
+  }
+
+  /// Amène la ligne surlignée dans la partie visible du volet, une fois celui-ci
+  /// en place.
+  void _scrollToHighlight() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = _highlightKey.currentContext;
+      if (ctx != null) {
+        Scrollable.ensureVisible(ctx,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeInOut,
+            alignment: 0.3);
+      }
+    });
+  }
+
   void _showCheckpointInfo(Map cp, int number) {
     final isMobileLayout = MediaQuery.sizeOf(context).width < 900;
     if (isMobileLayout) {
@@ -2147,18 +2707,11 @@ class _LivePageState extends State<LivePage> {
     } else {
       setState(() {
         _highlightedCheckpoint = number - 1;
+        _highlightedEndpoint = null;
         _openPanel = _SidePanel.waypoints;
+        _panelCollapsed = false;
       });
-      // Défilement vers l'item mis en évidence, une fois le volet en place.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        final ctx = _highlightKey.currentContext;
-        if (ctx != null) {
-          Scrollable.ensureVisible(ctx,
-              duration: const Duration(milliseconds: 300),
-              curve: Curves.easeInOut,
-              alignment: 0.3);
-        }
-      });
+      _scrollToHighlight();
     }
   }
 
@@ -2250,6 +2803,7 @@ class _LivePageState extends State<LivePage> {
     String? comment,
     List<String> photoUrls = const [],
     int? number,
+    double? distance,
     required bool isLast,
     bool highlighted = false,
     WaypointKind kind = WaypointKind.memo,
@@ -2280,9 +2834,7 @@ class _LivePageState extends State<LivePage> {
               : Icon(kind.isPause ? Icons.pause_rounded : Icons.location_on, color: Colors.white, size: 12),
         );
     }
-    final timeStr = time != null
-        ? '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}'
-        : '--:--';
+    final timeStr = _formatHms(time);
 
     return IntrinsicHeight(
       child: Row(
@@ -2330,25 +2882,24 @@ class _LivePageState extends State<LivePage> {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                  // Libellé (+ puce) dans un Expanded, l'heure derrière : c'est
+                  // ce qui cale toutes les heures sur la même colonne, quelle
+                  // que soit la longueur du libellé. Un Spacer partagerait
+                  // l'espace libre avec le libellé et décalerait l'heure d'une
+                  // ligne à l'autre.
                   Row(children: [
-                    Flexible(child: Text(label, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700))),
-                    // Puce « auto » : dit en toutes lettres ce que l'étincelle
-                    // code graphiquement (pause détectée par l'app).
-                    if (type == 'checkpoint' && kind.badgeLabel != null) ...[
-                      const SizedBox(width: 6),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                        decoration: BoxDecoration(
-                          borderRadius: BorderRadius.circular(4),
-                          border: Border.all(color: dotColor, width: 1),
-                        ),
-                        child: Text(kind.badgeLabel!,
-                          style: TextStyle(
-                            fontSize: 9, fontWeight: FontWeight.w700, height: 1.2, color: dotColor)),
-                      ),
-                    ],
-                    const Spacer(),
+                    Expanded(
+                      child: Text(label,
+                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
+                    ),
+                    const SizedBox(width: 10),
                     Text(timeStr, style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                    if (distance != null) ...[
+                      const SizedBox(width: 8),
+                      Text(_formatDistanceShort(distance),
+                        style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                    ],
                   ]),
                   if (comment != null && comment.isNotEmpty) ...[
                     const SizedBox(height: 4),
@@ -2416,9 +2967,14 @@ class _LivePageState extends State<LivePage> {
 
     final widgets = <Widget>[];
 
-    widgets.add(_buildTimelinePoint(
-      type: 'start', label: 'Départ', time: departureTime,
-      isLast: ++idx == total,
+    final startHighlighted = _highlightedEndpoint == 'start';
+    widgets.add(KeyedSubtree(
+      key: startHighlighted ? _highlightKey : null,
+      child: _buildTimelinePoint(
+        type: 'start', label: 'Départ', time: departureTime,
+        isLast: ++idx == total,
+        highlighted: startHighlighted,
+      ),
     ));
 
     for (final (i, cp) in _checkpoints.indexed) {
@@ -2428,10 +2984,14 @@ class _LivePageState extends State<LivePage> {
       widgets.add(KeyedSubtree(
         key: isHighlighted ? _highlightKey : null,
         child: _buildTimelinePoint(
-          type: 'checkpoint', label: kind.label, time: dt, kind: kind,
+          // Pause au bouton ou pause détectée par l'app : c'est une pause, point.
+          // La distinction ne dit rien à qui suit la sortie.
+          type: 'checkpoint', label: kind.isPause ? 'Pause' : kind.label,
+          time: dt, kind: kind,
           comment: cp['comment'] as String?,
           photoUrls: (cp['photo_urls'] as List?)?.cast<String>() ?? const [],
           number: i + 1,
+          distance: _distanceAtTime(dt),
           isLast: ++idx == total,
           highlighted: isHighlighted,
         ),
@@ -2439,208 +2999,306 @@ class _LivePageState extends State<LivePage> {
     }
 
     if (hasEndPoint) {
-      widgets.add(_buildTimelinePoint(
-        type: _isFinished ? 'end' : 'current',
-        label: _isFinished ? 'Arrivée' : 'Dernière position',
-        time: latestTime,
-        isLast: true,
+      final endHighlighted = _highlightedEndpoint == 'end';
+      widgets.add(KeyedSubtree(
+        key: endHighlighted ? _highlightKey : null,
+        child: _buildTimelinePoint(
+          type: _isFinished ? 'end' : 'current',
+          label: _isFinished ? 'Arrivée' : 'Dernière position',
+          time: latestTime,
+          distance: _totalDistanceMeters > 0 ? _totalDistanceMeters : null,
+          isLast: true,
+          highlighted: endHighlighted,
+        ),
       ));
     }
 
     return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: widgets);
   }
 
-  /// Feuille « Voir les détails » du panneau mobile : les points de passage, plus
-  /// un bouton « + d'infos » qui déplie le dénivelé et la vitesse (l'équivalent
-  /// du 2e onglet du volet desktop). Replié par défaut : la timeline reste
-  /// l'information de premier plan.
-  void _showDetailsSheet(BuildContext context) {
-    var statsExpanded = false;
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (_) => DraggableScrollableSheet(
-        initialChildSize: 0.45,
-        minChildSize: 0.22,
-        maxChildSize: 0.92,
-        snap: true,
-        snapSizes: const [0.22, 0.45, 0.92],
-        builder: (ctx, scrollCtrl) => StatefulBuilder(
-          builder: (ctx, setSheetState) => Container(
-            decoration: const BoxDecoration(
-              color: Color(0xFF18181B),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
-            ),
-            child: Column(children: [
-              const SizedBox(height: 10),
-              Container(width: 48, height: 4, decoration: BoxDecoration(color: Colors.white24, borderRadius: BorderRadius.circular(999))),
-              const SizedBox(height: 12),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(children: [
-                  const Text('Points de passage', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
-                  const SizedBox(width: 6),
-                  Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: () => Navigator.pop(ctx),
-                    child: Container(
-                      width: 28, height: 28,
-                      decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
-                      child: const Icon(Icons.close, color: Colors.white60, size: 15),
-                    ),
-                  ),
-                ]),
-              ),
-              const SizedBox(height: 14),
-              Expanded(
-                child: SingleChildScrollView(
-                  controller: scrollCtrl,
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      _buildWaypointTimeline(),
-                      if (!_stats.isEmpty) ...[
-                        const SizedBox(height: 6),
-                        GestureDetector(
-                          behavior: HitTestBehavior.opaque,
-                          onTap: () => setSheetState(() => statsExpanded = !statsExpanded),
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
-                            decoration: BoxDecoration(
-                              color: Colors.white.withValues(alpha: 0.05),
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: Colors.white12),
-                            ),
-                            child: Row(children: [
-                              const Icon(Icons.insights, color: Color(0xFF4F9CFF), size: 16),
-                              const SizedBox(width: 8),
-                              const Text('+ d\'infos',
-                                style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700)),
-                              const SizedBox(width: 6),
-                              const Text('Dénivelé · Vitesse',
-                                style: TextStyle(color: Colors.white38, fontSize: 12)),
-                              const Spacer(),
-                              Icon(statsExpanded ? Icons.expand_less : Icons.expand_more,
-                                color: Colors.white38, size: 20),
-                            ]),
-                          ),
-                        ),
-                        if (statsExpanded) ...[
-                          const SizedBox(height: 10),
-                          RideStatsSection(stats: _stats, live: !_isFinished),
-                        ],
-                      ],
-                    ],
-                  ),
-                ),
-              ),
-            ]),
-          ),
-        ),
-      ),
-    );
-  }
+  /// Largeur du volet desktop, bords compris.
+  static const double _kPanelWidth = 430;
 
-  /// Onglets verticaux du bord droit : « Points de passage », puis « Stats »
-  /// juste en dessous. Chacun déplie le même volet glissant, sur son contenu.
-  /// L'onglet Stats disparaît tant qu'il n'y a pas assez de points GPS pour
-  /// calculer quoi que ce soit.
-  Widget _buildSideTabs() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.end,
-      children: [
-        _buildSideTab(
-          label: 'Points de passage · $_waypointCount',
-          panel: _SidePanel.waypoints,
-        ),
-        if (!_stats.isEmpty) ...[
-          const SizedBox(height: 8),
-          _buildSideTab(label: '+ d\'infos', panel: _SidePanel.stats),
-        ],
-      ],
-    );
-  }
+  /// Volet flottant du bord droit : trois onglets (aperçu de la sortie, points
+  /// de passage, statistiques) dans une seule carte, qui s'étire jusqu'à la
+  /// hauteur disponible puis fait défiler son contenu. L'onglet « + d'infos »
+  /// disparaît tant qu'il n'y a pas assez de points GPS pour calculer quoi que
+  /// ce soit.
+  Widget _buildDesktopPanel() {
+    final tabs = <(_SidePanel, String)>[
+      (_SidePanel.overview, 'Aperçu'),
+      (_SidePanel.waypoints, 'Points de passage'),
+      if (!_stats.isEmpty) (_SidePanel.stats, '+ d\'infos'),
+    ];
+    // Le tracé peut perdre ses stats entre deux rafraîchissements : on ne laisse
+    // pas l'onglet actif pointer dans le vide.
+    final active = tabs.any((t) => t.$1 == _openPanel) ? _openPanel : _SidePanel.overview;
 
-  Widget _buildSideTab({required String label, required _SidePanel panel}) {
-    return GestureDetector(
-      onTap: () => setState(() {
-        _highlightedCheckpoint = null;
-        _openPanel = panel;
-      }),
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 10),
-        decoration: BoxDecoration(
-          color: const Color(0xFF1B1B1B),
-          borderRadius: const BorderRadius.only(
-            topLeft: Radius.circular(10),
-            bottomLeft: Radius.circular(10),
-          ),
-          border: Border.all(color: Colors.white12),
-          boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.4), blurRadius: 12)],
-        ),
-        child: RotatedBox(
-          quarterTurns: 3,
-          child: Text(
-            label,
-            style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w700, letterSpacing: 0.2),
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildDesktopSidePanel(double topPadding, double bottomPadding) {
-    final isStats = _openPanel == _SidePanel.stats;
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF0D0D0D).withValues(alpha: 0.96),
-        border: const Border(left: BorderSide(color: Colors.white12)),
-        boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 20, offset: const Offset(-4, 0))],
-      ),
-      child: Column(children: [
-        SizedBox(height: topPadding + 12),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
-          child: Row(children: [
-            Text(isStats ? '+ d\'infos' : 'Points de passage',
-                style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700)),
-            if (!isStats) ...[
-              const SizedBox(width: 6),
-              Text('· $_waypointCount', style: const TextStyle(color: Colors.white38, fontSize: 14, fontWeight: FontWeight.w600)),
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(20),
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFF0E1013).withValues(alpha: 0.92),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withValues(alpha: 0.5), blurRadius: 30, offset: const Offset(0, 12)),
             ],
-            const Spacer(),
-            GestureDetector(
-              onTap: () => setState(() {
-                _highlightedCheckpoint = null;
-                _openPanel = null;
-              }),
-              child: Container(
-                width: 28, height: 28,
-                decoration: BoxDecoration(color: Colors.white12, borderRadius: BorderRadius.circular(8)),
-                child: const Icon(Icons.close, color: Colors.white60, size: 15),
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 16, 10, 0),
+              child: Row(children: [
+                for (final (panel, label) in tabs)
+                  _buildPanelTab(label: label, panel: panel, active: panel == active),
+                const Spacer(),
+                _buildPanelCollapseButton(),
+              ]),
+            ),
+            Container(height: 1, color: Colors.white.withValues(alpha: 0.07)),
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 20),
+                child: switch (active) {
+                  _SidePanel.overview => _buildOverviewTab(),
+                  _SidePanel.waypoints => _buildWaypointTimeline(),
+                  _SidePanel.stats => RideStatsSection(stats: _stats, live: !_isFinished),
+                },
               ),
             ),
           ]),
         ),
-        Container(height: 1, color: Colors.white12),
-        Expanded(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
-            child: isStats
-                ? RideStatsSection(stats: _stats, live: !_isFinished)
-                : _buildWaypointTimeline(),
+      ),
+    );
+  }
+
+  /// Un onglet du volet : libellé souligné de violet quand il est actif.
+  /// [compact] : version mobile, où les trois onglets se partagent la largeur
+  /// de l'écran et se placent donc eux-mêmes (pas de marge à droite).
+  Widget _buildPanelTab({
+    required String label,
+    required _SidePanel panel,
+    required bool active,
+    bool compact = false,
+  }) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => setState(() {
+          _highlightedCheckpoint = null;
+          _highlightedEndpoint = null;
+          _openPanel = panel;
+        }),
+        child: Padding(
+          padding: EdgeInsets.only(right: compact ? 0 : 22),
+          // IntrinsicWidth : le trait actif prend exactement la largeur du
+          // libellé, que la Row ne contraint pas.
+          child: IntrinsicWidth(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: Text(label,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: active ? Colors.white : Colors.white54,
+                        fontSize: compact ? 13 : 14.5,
+                        // Graisse constante : une graisse variable changerait la
+                        // largeur du libellé et ferait danser les onglets.
+                        fontWeight: FontWeight.w600,
+                      )),
+                ),
+                Container(
+                  height: 3,
+                  decoration: BoxDecoration(
+                    color: active ? const Color(0xFF8B5CF6) : Colors.transparent,
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(3)),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
-        Container(height: 1, color: Colors.white12),
-        Padding(
-          padding: EdgeInsets.fromLTRB(14, 12, 14, 14 + bottomPadding),
-          child: _buildPositionCard(),
+      ),
+    );
+  }
+
+  /// Bouton de repli du volet, à droite des onglets.
+  Widget _buildPanelCollapseButton() {
+    return Tooltip(
+      message: 'Replier le volet',
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: () => setState(() => _panelCollapsed = true),
+          child: Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            width: 30, height: 30,
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.07),
+              borderRadius: BorderRadius.circular(9),
+            ),
+            child: const Icon(Icons.chevron_right, color: Colors.white60, size: 18),
+          ),
         ),
+      ),
+    );
+  }
+
+  /// Poignée verticale du bord droit, seule trace du volet quand il est replié.
+  Widget _buildPanelHandle() {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: () => setState(() => _panelCollapsed = false),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 9),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0E1013).withValues(alpha: 0.92),
+            borderRadius: const BorderRadius.horizontal(left: Radius.circular(12)),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
+            boxShadow: [BoxShadow(color: Colors.black.withValues(alpha: 0.45), blurRadius: 16)],
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.chevron_left, color: Colors.white70, size: 18),
+            const SizedBox(height: 10),
+            RotatedBox(
+              quarterTurns: 3,
+              child: Text('Détails',
+                  style: TextStyle(
+                    color: Colors.white.withValues(alpha: 0.85),
+                    fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.2,
+                  )),
+            ),
+            const SizedBox(height: 8),
+            // Le libellé pivoté se lit de bas en haut : l'icône est donc placée
+            // en bas de la colonne pour précéder le mot « Détails ».
+            const Icon(Icons.info_outline, color: Colors.white70, size: 18),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  /// Onglet « Aperçu » : l'état du direct (heure du dernier point, statut,
+  /// batterie, signal), l'ouverture dans une app de navigation, puis le résumé
+  /// chiffré de la sortie.
+  Widget _buildOverviewTab() {
+    const violet = Color(0xFF8B5CF6);
+    final unknown = rideStatus == 'unknown' || lastUpdate == null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          unknown
+              ? 'Position inconnue'
+              : '${_isFinished ? 'Arrivée' : 'Position actualisée'} à ${_formatHms(lastUpdate)}',
+          style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 14),
+        _buildStatusPill(large: true),
+        if (_batteryLevel != null) ...[
+          const SizedBox(height: 14),
+          _buildBatteryChip(_batteryLevel!, large: true),
+        ],
+        if (!_isFinished) ...[
+          const SizedBox(height: 10),
+          _buildSignalIndicator(large: true),
+        ],
+        const SizedBox(height: 18),
+        _DesktopFlatButton(
+          icon: Icons.map_outlined,
+          label: 'Ouvrir la position',
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: Colors.white.withValues(alpha: 0.18)),
+          onTap: () => _showNavigationSheet(context),
+        ),
+        const SizedBox(height: 18),
+        Container(height: 1, color: Colors.white.withValues(alpha: 0.08)),
+        const SizedBox(height: 6),
+        _buildOverviewRow(
+          icon: Icons.play_arrow,
+          color: const Color(0xFFFF8A00),
+          label: 'Départ',
+          sub: _formatLongDateFr(rideStartTime),
+          value: _formatHms(rideStartTime),
+        ),
+        // Pas de ligne pour le dernier point : son heure est déjà en tête de
+        // l'onglet (« Position actualisée à … »), la répéter ici n'apprend rien.
+        _buildOverviewRow(
+          icon: Icons.add_road,
+          color: violet,
+          label: 'Distance',
+          value: _formatDistance(_totalDistanceMeters),
+        ),
+        // Mêmes libellés et icônes que l'app mobile : chronomètre vert pour le
+        // temps de roulage, horloge blanche pour le temps écoulé.
+        _buildOverviewRow(
+          icon: Icons.timer_outlined,
+          color: const Color(0xFF4ADE80),
+          label: 'Durée mouv.',
+          value: _formatDuration(_rideDuration),
+        ),
+        if (_elapsedSinceStart != null)
+          _buildOverviewRow(
+            icon: Icons.schedule,
+            color: Colors.white,
+            label: 'Durée totale',
+            value: _formatDuration(_elapsedSinceStart!),
+          ),
+      ],
+    );
+  }
+
+  /// Une ligne du résumé : pastille d'icône, libellé (+ date au besoin), valeur
+  /// calée à droite dans la couleur de la ligne.
+  Widget _buildOverviewRow({
+    required IconData icon,
+    required Color color,
+    required String label,
+    String? sub,
+    required String value,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Row(children: [
+        Container(
+          width: 40, height: 40,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.06),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: color, size: 20),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(label,
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white70, fontSize: 15, fontWeight: FontWeight.w500)),
+              if (sub != null) ...[
+                const SizedBox(height: 2),
+                Text(sub,
+                    maxLines: 1, overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w600)),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(width: 10),
+        Text(value,
+            style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.w700, letterSpacing: -0.2)),
       ]),
     );
   }
@@ -2667,54 +3325,49 @@ class _LivePageState extends State<LivePage> {
             top: 0, left: 0, right: 0,
             child: KeyedSubtree(
               key: _topOverlayKey,
-              child: _buildTopOverlay(isMobileLayout, topPadding),
-            ),
-          ),
-          Positioned(
-            bottom: 0, left: 0, right: 0,
-            child: KeyedSubtree(
-              key: _bottomOverlayKey,
               child: isMobileLayout
-                  ? Column(
-                      mainAxisSize: MainAxisSize.min,
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        // Contrôles carte flottants, alignés au-dessus du panneau
-                        Padding(
-                          padding: const EdgeInsets.only(right: 14, bottom: 10),
-                          child: Align(
-                            alignment: Alignment.centerRight,
-                            child: _buildMapControls(),
-                          ),
-                        ),
-                        _buildMobileBottomPanel(bottomPadding),
-                      ],
-                    )
-                  : _buildDesktopBottomBar(bottomPadding),
+                  ? _buildMobileTopOverlay(topPadding)
+                  : _buildTopOverlay(topPadding),
             ),
           ),
-          // Desktop: onglets repliables + volet droit
-          if (!isMobileLayout) ...[
+          // Desktop : contrôles carte en bas à gauche, coin resté libre depuis
+          // que tout l'état de la sortie est dans le volet. En mobile ils sont
+          // portés par le bas d'écran, juste au-dessus du panneau.
+          if (!isMobileLayout)
             Positioned(
-              right: 0,
-              top: topPadding + 80,
-              child: IgnorePointer(
-                ignoring: _openPanel != null,
-                child: AnimatedOpacity(
-                  duration: const Duration(milliseconds: 200),
-                  opacity: _openPanel != null ? 0.0 : 1.0,
-                  child: _buildSideTabs(),
-                ),
+              left: 22,
+              bottom: 46 + bottomPadding,
+              child: KeyedSubtree(key: _desktopControlsKey, child: _buildMapControls()),
+            ),
+          if (isMobileLayout)
+            Positioned(
+              bottom: 0, left: 0, right: 0,
+              child: KeyedSubtree(
+                key: _bottomOverlayKey,
+                child: _buildMobileBottomOverlay(bottomPadding),
+              ),
+            ),
+          // Desktop : volet flottant à droite, et sa poignée quand il est replié.
+          if (!isMobileLayout) ...[
+            AnimatedPositioned(
+              duration: const Duration(milliseconds: 260),
+              curve: Curves.easeInOut,
+              top: topPadding + 84,
+              bottom: 28 + bottomPadding,
+              right: _panelCollapsed ? -(_kPanelWidth + 30) : 24,
+              width: _kPanelWidth,
+              // Le volet s'arrête à la hauteur de son contenu, centré dans la
+              // place disponible, et ne défile qu'au-delà.
+              child: Center(
+                child: KeyedSubtree(key: _desktopPanelKey, child: _buildDesktopPanel()),
               ),
             ),
             AnimatedPositioned(
-              duration: const Duration(milliseconds: 250),
+              duration: const Duration(milliseconds: 260),
               curve: Curves.easeInOut,
-              top: 0,
-              bottom: 0,
-              right: _openPanel != null ? 0 : -340,
-              width: 340,
-              child: _buildDesktopSidePanel(topPadding, bottomPadding),
+              top: topPadding + 84,
+              right: _panelCollapsed ? 0 : -80,
+              child: _buildPanelHandle(),
             ),
           ],
         ],

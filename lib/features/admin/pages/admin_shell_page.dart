@@ -34,8 +34,8 @@ class _AdminShellPageState extends State<AdminShellPage> {
   @override
   Widget build(BuildContext context) {
     // La session Supabase est déjà résolue après Supabase.initialize() dans
-    // main() (le magic link est capté au chargement). Le stream ne sert qu'à
-    // rebuild sur connexion/déconnexion.
+    // main() (session persistée restaurée au chargement). Le stream ne sert
+    // qu'à rebuild sur connexion/déconnexion.
     return StreamBuilder<AuthState>(
       stream: AuthService.authStateChanges,
       builder: (context, snapshot) {

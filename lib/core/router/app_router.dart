@@ -1,7 +1,6 @@
 import 'package:go_router/go_router.dart';
 import '../../features/live/live_page.dart';
 import '../../features/auth/pages/login_page.dart';
-import '../../features/auth/pages/link_sent_page.dart';
 import '../../features/admin/pages/admin_shell_page.dart';
 
 final appRouter = GoRouter(
@@ -19,14 +18,6 @@ final appRouter = GoRouter(
       path: '/admin/login',
       builder: (context, state) => const LoginPage(),
     ),
-    GoRoute(
-      path: '/admin/link-sent',
-      builder: (context, state) {
-        final email = state.uri.queryParameters['email'] ?? '';
-        return LinkSentPage(email: email);
-      },
-    ),
-
     // Admin — le guard est dans AdminShellPage via StreamBuilder
     GoRoute(
       path: '/admin',

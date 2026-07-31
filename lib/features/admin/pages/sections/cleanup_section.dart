@@ -3,7 +3,41 @@ import 'dart:html' as html;
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart'; // DateFormat utilisé dans _exportCsv et _fmtDate
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../../../../core/auth/auth_service.dart';
 import '../../../../core/theme/admin_theme.dart';
+
+// Message unique : sans is_admin(), la RLS renvoie des tableaux vides et chaque
+// panneau conclurait « rien à nettoyer » alors qu'il ne voit simplement rien.
+// L'email connecté est rappelé — c'est presque toujours lui le coupable.
+String get _kNotAdminError =>
+    'Compte « ${AuthService.currentUser?.email ?? '?'} » sans droits admin côté '
+    'Supabase : is_admin() renvoie false, la RLS masque donc toutes les lignes. '
+    'Des compteurs à 0 ne signifient PAS que la base est propre. '
+    'Connecte-toi avec le compte inscrit dans public.admins.';
+
+// PostgREST plafonne chaque réponse (1000 lignes par défaut). Sans pagination,
+// une analyse ne voit qu'un échantillon arbitraire : elle rate des orphelines,
+// et un contrôle d'existence tronqué en invente de fausses.
+const int _kPageSize = 1000;
+
+// Un filtre `in` voyage dans l'URL : au-delà de quelques centaines d'IDs la
+// requête est rejetée. On interroge par lots.
+const int _kInChunk = 200;
+
+/// Enchaîne les pages de [page] jusqu'à ce qu'une page incomplète signale la fin.
+Future<List<Map<String, dynamic>>> _fetchAllPages(
+  PostgrestTransformBuilder<PostgrestList> Function(int from, int to) page,
+) async {
+  final all = <Map<String, dynamic>>[];
+  var from = 0;
+  while (true) {
+    final rows = await page(from, from + _kPageSize - 1);
+    all.addAll(rows);
+    if (rows.length < _kPageSize) break;
+    from += _kPageSize;
+  }
+  return all;
+}
 
 class CleanupSection extends StatefulWidget {
   const CleanupSection({super.key});
@@ -34,6 +68,8 @@ class _CleanupSectionState extends State<CleanupSection> {
   int _orphanPositions = 0;
   int _ghostSessions = 0;
   int _orphanRides = 0;
+  // Suivis écartés du lot parce qu'ils émettent encore (cf. _kLiveGrace).
+  int _liveProtected = 0;
   double _estimatedMb = 0;
   final List<_PreviewRow> _previewRows = [];
 
@@ -51,71 +87,143 @@ class _CleanupSectionState extends State<CleanupSection> {
   double _orphanStorageMb = 0;
   final List<String> _orphanStoragePaths = [];
 
+  // Sessions référencées par des positions mais absentes de safety_sessions.
+  // Mémorisé à l'analyse pour que la purge supprime par filtre POSITIF
+  // (`session_id IN (...)`) au lieu d'un « tout sauf les valides » qui, sur une
+  // liste de sessions tronquée, effacerait les positions de sorties bien vivantes.
+  final List<String> _orphanPositionSessionIds = [];
+
+  // Garde-fou « suivi actif ». À seuil 0 toute session non terminée devient
+  // fantôme, y compris celle qui remonte des positions en ce moment même. L'app
+  // mobile pousse un point toutes les ~15 s : 30 min de silence, c'est 120
+  // points manqués — largement au-delà d'un tunnel ou d'une zone blanche, alors
+  // qu'un suivi mort (app tuée, batterie à plat) n'émet plus jamais.
+  // Une session `paused` n'émet rien : elle n'est donc protégée que dans les
+  // 30 min suivant la pause. C'est voulu — ne pas couper une pause café, sans
+  // prétendre couvrir une pause d'une nuit.
+  static const Duration _kLiveGrace = Duration(minutes: 30);
+
+  /// Sessions parmi [ids] ayant reçu une position après [since].
+  Future<Set<String>> _sessionsWithRecentPosition(
+      SupabaseClient supabase, List<String> ids, DateTime since) async {
+    final live = <String>{};
+    for (var i = 0; i < ids.length; i += _kInChunk) {
+      final end = (i + _kInChunk < ids.length) ? i + _kInChunk : ids.length;
+      final rows = await _fetchAllPages((f, t) => supabase
+          .from('safety_positions')
+          .select('session_id')
+          .inFilter('session_id', ids.sublist(i, end))
+          .gt('created_at', since.toIso8601String())
+          .range(f, t));
+      live.addAll(rows.map((r) => r['session_id'] as String));
+    }
+    return live;
+  }
+
+  /// Sous-ensemble de [ids] réellement présent dans `safety_sessions`.
+  Future<Set<String>> _existingSessionIds(
+      SupabaseClient supabase, List<String> ids) async {
+    final found = <String>{};
+    for (var i = 0; i < ids.length; i += _kInChunk) {
+      final end = (i + _kInChunk < ids.length) ? i + _kInChunk : ids.length;
+      final rows = await _fetchAllPages((f, t) => supabase
+          .from('safety_sessions')
+          .select('id')
+          .inFilter('id', ids.sublist(i, end))
+          .range(f, t));
+      found.addAll(rows.map((r) => r['id'] as String));
+    }
+    return found;
+  }
+
   // ── Analyse ────────────────────────────────────────────────────────────────
   Future<void> _analyze() async {
-    setState(() { _analyzing = true; _analyzed = false; _error = null; _ghostDetails.clear(); _orphanStoragePaths.clear(); });
+    setState(() {
+      _analyzing = true; _analyzed = false; _error = null;
+      _ghostDetails.clear(); _orphanStoragePaths.clear();
+      _orphanPositionSessionIds.clear(); _liveProtected = 0;
+    });
 
     try {
+      // Trancher AVANT de compter : « rien à purger » et « rien de visible »
+      // se ressemblent trop pour être laissés indistincts.
+      if (!await AuthService.isServerAdmin()) {
+        setState(() => _error = _kNotAdminError);
+        return;
+      }
+
       final supabase = Supabase.instance.client;
-      final cutoff48h = DateTime.now().subtract(Duration(hours: _thresholdInProgressHours));
-      final cutoff7d  = DateTime.now().subtract(Duration(days: _thresholdPausedDays));
+      // .toUtc() indispensable : `started_at` est un timestamptz, et un ISO local
+      // sans fuseau serait lu comme de l'UTC — en France le seuil dériverait de
+      // 1 à 2 h, dans le sens qui purge trop tôt.
+      final now = DateTime.now().toUtc();
+      final cutoff48h = now.subtract(Duration(hours: _thresholdInProgressHours));
+      final cutoff7d  = now.subtract(Duration(days: _thresholdPausedDays));
 
       // 1. Positions orphelines
-      final allPositionSessionIds = await supabase
-          .from('safety_positions')
-          .select('session_id');
+      final allPositionSessionIds = await _fetchAllPages((f, t) =>
+          supabase.from('safety_positions').select('session_id').range(f, t));
 
-      final sessionIds = (allPositionSessionIds as List)
+      final sessionIds = allPositionSessionIds
           .map((r) => r['session_id'] as String?)
           .whereType<String>()
           .toSet()
           .toList();
 
       int orphanCount = 0;
+      final orphanSessionIds = <String>[];
       if (sessionIds.isNotEmpty) {
-        final validSessions = await supabase
-            .from('safety_sessions')
-            .select('id')
-            .inFilter('id', sessionIds);
-        final validIds = (validSessions as List).map((r) => r['id'] as String).toSet();
-        final orphanSessionIds = sessionIds.where((id) => !validIds.contains(id)).toList();
-        if (orphanSessionIds.isNotEmpty) {
-          final orphanResult = await supabase
+        final validIds = await _existingSessionIds(supabase, sessionIds);
+        orphanSessionIds.addAll(sessionIds.where((id) => !validIds.contains(id)));
+        for (var i = 0; i < orphanSessionIds.length; i += _kInChunk) {
+          final end = (i + _kInChunk < orphanSessionIds.length) ? i + _kInChunk : orphanSessionIds.length;
+          final res = await supabase
               .from('safety_positions')
               .select('id')
-              .inFilter('session_id', orphanSessionIds)
+              .inFilter('session_id', orphanSessionIds.sublist(i, end))
               .count(CountOption.exact);
-          orphanCount = orphanResult.count;
+          orphanCount += res.count;
         }
       }
 
       // 2. Sessions fantômes in_progress > 48h — avec détails
-      final ghostInProgressRows = await supabase
+      final ghostInProgressList = await _fetchAllPages((f, t) => supabase
           .from('safety_sessions')
           .select('id, share_code, started_at, status')
           .isFilter('ended_at', null)
           .eq('status', 'in_progress')
           .lt('started_at', cutoff48h.toIso8601String())
-          .order('started_at', ascending: false);
+          .order('started_at', ascending: false)
+          .range(f, t));
 
       // 3. Sessions fantômes paused > 7j — avec détails
-      final ghostPausedRows = await supabase
+      final ghostPausedList = await _fetchAllPages((f, t) => supabase
           .from('safety_sessions')
           .select('id, share_code, started_at, status')
           .isFilter('ended_at', null)
           .eq('status', 'paused')
           .lt('started_at', cutoff7d.toIso8601String())
-          .order('started_at', ascending: false);
+          .order('started_at', ascending: false)
+          .range(f, t));
 
-      final ghostInProgressList = List<Map<String, dynamic>>.from(ghostInProgressRows);
-      final ghostPausedList = List<Map<String, dynamic>>.from(ghostPausedRows);
+      // 3bis. Écarter les suivis encore vivants (cf. _kLiveGrace).
+      final candidateIds = [...ghostInProgressList, ...ghostPausedList]
+          .map((s) => s['id'] as String)
+          .toList();
+      final liveIds = candidateIds.isEmpty
+          ? <String>{}
+          : await _sessionsWithRecentPosition(
+              supabase, candidateIds, now.subtract(_kLiveGrace));
+      ghostInProgressList.removeWhere((s) => liveIds.contains(s['id']));
+      ghostPausedList.removeWhere((s) => liveIds.contains(s['id']));
+
       final allGhosts = [...ghostInProgressList, ...ghostPausedList];
 
       // 4. Rides avec safetySessionId inexistant dans safety_sessions.
       //    On récupère aussi user_id/started_at : nécessaires pour retrouver le
       //    dossier Storage (étape 5) et pour la réparation lors de la purge.
-      final ridesData = await supabase.from('rides').select('ride_json, user_id, started_at');
-      final allRidesJson = List<Map<String, dynamic>>.from(ridesData);
+      final allRidesJson = await _fetchAllPages((f, t) =>
+          supabase.from('rides').select('ride_json, user_id, started_at').range(f, t));
       final rideSessionRefs = allRidesJson
           .map((r) => (r['ride_json'] as Map?)?['safetySessionId'] as String?)
           .whereType<String>()
@@ -124,11 +232,7 @@ class _CleanupSectionState extends State<CleanupSection> {
 
       final deadRideSessionIds = <String>[];
       if (rideSessionRefs.isNotEmpty) {
-        final existingSessions = await supabase
-            .from('safety_sessions')
-            .select('id')
-            .inFilter('id', rideSessionRefs);
-        final existingIds = (existingSessions as List).map((r) => r['id'] as String).toSet();
+        final existingIds = await _existingSessionIds(supabase, rideSessionRefs);
         deadRideSessionIds.addAll(rideSessionRefs.where((ref) => !existingIds.contains(ref)));
       }
 
@@ -175,6 +279,7 @@ class _CleanupSectionState extends State<CleanupSection> {
       setState(() {
         _orphanPositions = orphanCount;
         _ghostSessions = allGhosts.length;
+        _liveProtected = liveIds.length;
         _orphanRides = deadRideSessionIds.length;
         _orphanStorageFiles = orphanStoragePaths.length;
         _orphanStorageMb = orphanStorageBytes / (1024 * 1024);
@@ -185,6 +290,9 @@ class _CleanupSectionState extends State<CleanupSection> {
         _orphanRideSessionIds
           ..clear()
           ..addAll(deadRideSessionIds);
+        _orphanPositionSessionIds
+          ..clear()
+          ..addAll(orphanSessionIds);
         _orphanStoragePaths
           ..clear()
           ..addAll(orphanStoragePaths);
@@ -215,17 +323,20 @@ class _CleanupSectionState extends State<CleanupSection> {
   Future<void> _purge() async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder: (_) => _ConfirmDialog(total: _totalRows),
+      builder: (_) => _ConfirmDialog(
+        total: _totalRows,
+        // À seuil 0, un tracking encore actif entre dans le lot : l'admin doit
+        // le voir sur l'écran de confirmation, pas le découvrir après coup.
+        includesLive: _thresholdInProgressHours == 0 || _thresholdPausedDays == 0,
+      ),
     );
     if (confirmed != true) return;
 
     setState(() { _purging = true; _error = null; });
     try {
       final supabase = Supabase.instance.client;
-      final cutoff48h = DateTime.now().subtract(Duration(hours: _thresholdInProgressHours));
-      final cutoff7d  = DateTime.now().subtract(Duration(days: _thresholdPausedDays));
 
-      // Récupère les IDs des sessions fantômes à supprimer
+      // Les IDs figés par l'analyse : le lot purgé est celui qui a été affiché.
       final ghostIds = _ghostDetails.map((s) => s['id'] as String).toList();
 
       // ÉTAPE 0 — RÉPARER (et non supprimer) les rides liés à une session
@@ -235,8 +346,9 @@ class _CleanupSectionState extends State<CleanupSection> {
       int repairedRides = 0;
       final allDeadSessionIds = {...ghostIds, ..._orphanRideSessionIds};
       if (allDeadSessionIds.isNotEmpty) {
-        final ridesData = await supabase.from('rides').select('ride_json, user_id, started_at');
-        for (final r in (ridesData as List)) {
+        final ridesData = await _fetchAllPages((f, t) =>
+            supabase.from('rides').select('ride_json, user_id, started_at').range(f, t));
+        for (final r in ridesData) {
           final rawJson = r['ride_json'];
           if (rawJson is! Map) continue;
           final sessionId = rawJson['safetySessionId'] as String?;
@@ -260,32 +372,31 @@ class _CleanupSectionState extends State<CleanupSection> {
             .inFilter('session_id', ghostIds);
       }
 
-      // ÉTAPE 2 — Supprimer les positions orphelines (sans session du tout)
-      if (_orphanPositions > 0) {
-        final validSessions = await supabase.from('safety_sessions').select('id');
-        final validIds = (validSessions as List).map((r) => r['id'] as String).toList();
-        if (validIds.isNotEmpty) {
-          await supabase.from('safety_positions').delete()
-              .not('session_id', 'in', '(${validIds.map((id) => '"$id"').join(',')})');
-        } else {
-          await supabase.from('safety_positions').delete().neq('id', 0);
-        }
+      // ÉTAPE 2 — Supprimer les positions orphelines (sans session du tout).
+      // Filtre POSITIF sur les session_id identifiés à l'analyse : un « tout
+      // sauf les sessions valides » s'appuierait sur une liste plafonnée par
+      // PostgREST et effacerait les positions de sorties bien vivantes.
+      for (var i = 0; i < _orphanPositionSessionIds.length; i += _kInChunk) {
+        final end = (i + _kInChunk < _orphanPositionSessionIds.length)
+            ? i + _kInChunk
+            : _orphanPositionSessionIds.length;
+        await supabase.from('safety_positions').delete()
+            .inFilter('session_id', _orphanPositionSessionIds.sublist(i, end));
       }
 
-      // ÉTAPE 3 — Supprimer les sessions fantômes (maintenant sans positions)
-      final deletedInProgress = await supabase.from('safety_sessions')
-          .delete()
-          .isFilter('ended_at', null).eq('status', 'in_progress')
-          .lt('started_at', cutoff48h.toIso8601String())
-          .select('id');
-
-      final deletedPaused = await supabase.from('safety_sessions')
-          .delete()
-          .isFilter('ended_at', null).eq('status', 'paused')
-          .lt('started_at', cutoff7d.toIso8601String())
-          .select('id');
-
-      final totalDeleted = (deletedInProgress as List).length + (deletedPaused as List).length;
+      // ÉTAPE 3 — Supprimer les sessions fantômes (maintenant sans positions).
+      // On supprime EXACTEMENT les IDs retenus par l'analyse. Rejouer ici les
+      // filtres de date emporterait les sessions devenues fantômes depuis —
+      // dont un suivi actif que le garde-fou venait d'écarter.
+      int totalDeleted = 0;
+      for (var i = 0; i < ghostIds.length; i += _kInChunk) {
+        final end = (i + _kInChunk < ghostIds.length) ? i + _kInChunk : ghostIds.length;
+        final deleted = await supabase.from('safety_sessions')
+            .delete()
+            .inFilter('id', ghostIds.sublist(i, end))
+            .select('id');
+        totalDeleted += (deleted as List).length;
+      }
 
       // ÉTAPE 4 — Supprimer les fichiers Storage orphelins (dossiers sans ride).
       // Best-effort, par lots (l'API remove accepte une liste de chemins).
@@ -307,8 +418,9 @@ class _CleanupSectionState extends State<CleanupSection> {
 
       setState(() {
         _orphanPositions = 0; _ghostSessions = 0; _orphanRides = 0; _estimatedMb = 0;
-        _orphanStorageFiles = 0; _orphanStorageMb = 0;
+        _orphanStorageFiles = 0; _orphanStorageMb = 0; _liveProtected = 0;
         _previewRows.clear(); _ghostDetails.clear(); _orphanRideSessionIds.clear();
+        _orphanPositionSessionIds.clear();
         _orphanStoragePaths.clear(); _analyzed = false;
       });
 
@@ -463,14 +575,9 @@ class _CleanupSectionState extends State<CleanupSection> {
                   onChanged: (v) => setState(() => _thresholdInProgressHours = v),
                 ),
               ]),
-              const Padding(
-                padding: EdgeInsets.only(top: 5, left: 2),
-                child: Row(children: [
-                  Icon(Icons.info_outline, size: 11, color: AdminColors.textSecondary),
-                  SizedBox(width: 4),
-                  Text('Valeur personnalisable',
-                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 11)),
-                ]),
+              _ThresholdHint(
+                zero: _thresholdInProgressHours == 0,
+                zeroLabel: '0 h = toute session non terminée, y compris un suivi en cours',
               ),
             ]),
             const SizedBox(height: 14),
@@ -499,14 +606,9 @@ class _CleanupSectionState extends State<CleanupSection> {
                   onChanged: (v) => setState(() => _thresholdPausedDays = v),
                 ),
               ]),
-              const Padding(
-                padding: EdgeInsets.only(top: 5, left: 2),
-                child: Row(children: [
-                  Icon(Icons.info_outline, size: 11, color: AdminColors.textSecondary),
-                  SizedBox(width: 4),
-                  Text('Valeur personnalisable',
-                      style: TextStyle(color: AdminColors.textSecondary, fontSize: 11)),
-                ]),
+              _ThresholdHint(
+                zero: _thresholdPausedDays == 0,
+                zeroLabel: '0 j = toute session en pause, même mise en pause à l\'instant',
               ),
             ]),
           ]),
@@ -574,6 +676,28 @@ class _CleanupSectionState extends State<CleanupSection> {
               tooltip: 'Estimation basée sur :\n~200 octets par position GPS\n~500 octets par session\n+ taille réelle des photos Storage orphelines',
             )),
           ]),
+
+          // Suivis actifs écartés : sans ce retour, l'admin croirait à une
+          // détection défaillante alors que le garde-fou a fait son travail.
+          if (_liveProtected > 0) ...[
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: AdminColors.warningDim,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AdminColors.warning, width: 0.5)),
+              child: Row(children: [
+                const Icon(Icons.podcasts, color: AdminColors.warning, size: 16),
+                const SizedBox(width: 8),
+                Expanded(child: Text(
+                  '$_liveProtected suivi(s) actif(s) écarté(s) — position reçue il y a '
+                  'moins de ${_kLiveGrace.inMinutes} min. Non compté, non supprimé.',
+                  style: const TextStyle(color: AdminColors.warning, fontSize: 13),
+                )),
+              ]),
+            ),
+          ],
 
           // Aperçu résumé
           if (_previewRows.isNotEmpty) ...[
@@ -776,6 +900,7 @@ class _ThresholdInputField extends StatefulWidget {
 class _ThresholdInputFieldState extends State<_ThresholdInputField> {
   late String _selectedUnit;
   late TextEditingController _ctrl;
+  late FocusNode _focus;
 
   // Conversion factor: base unit → selected unit
   int get _factor {
@@ -792,6 +917,18 @@ class _ThresholdInputFieldState extends State<_ThresholdInputField> {
     super.initState();
     _selectedUnit = widget.units.first;
     _ctrl = TextEditingController(text: '${widget.value}');
+    // Une saisie invalide (vide, 0, au-delà du max) est refusée par
+    // _onTextChanged : sans resynchro, le champ continue d'afficher une valeur
+    // qui n'est PAS celle utilisée par l'analyse. On réaligne à la sortie du
+    // champ pour que l'affiché soit toujours l'effectif.
+    _focus = FocusNode()..addListener(() {
+      if (!_focus.hasFocus) _syncText();
+    });
+  }
+
+  void _syncText() {
+    final shown = '$_displayValue';
+    if (_ctrl.text != shown) _ctrl.text = shown;
   }
 
   @override
@@ -805,13 +942,17 @@ class _ThresholdInputFieldState extends State<_ThresholdInputField> {
 
   @override
   void dispose() {
+    _focus.dispose();
     _ctrl.dispose();
     super.dispose();
   }
 
   void _onTextChanged(String text) {
     final v = int.tryParse(text);
-    if (v == null || v < 1) return;
+    // 0 est une valeur légitime : « tout ce qui n'est pas terminé est fantôme ».
+    // Seuls le vide (saisie en cours) et le négatif sont ignorés — la resynchro
+    // sur perte de focus rétablit alors l'affichage de la valeur effective.
+    if (v == null || v < 0) return;
     final base = v * _factor;
     if (base <= widget.max) widget.onChanged(base);
   }
@@ -832,6 +973,7 @@ class _ThresholdInputFieldState extends State<_ThresholdInputField> {
         height: 36,
         child: TextField(
           controller: _ctrl,
+          focusNode: _focus,
           keyboardType: TextInputType.number,
           textAlign: TextAlign.center,
           style: const TextStyle(color: AdminColors.textPrimary, fontSize: 14),
@@ -878,6 +1020,29 @@ class _ThresholdInputFieldState extends State<_ThresholdInputField> {
   }
 }
 
+/// Légende sous un champ de seuil. À 0 le seuil n'exclut plus rien : on passe
+/// en avertissement, parce qu'une session « fantôme » devient alors n'importe
+/// quelle session non terminée — y compris un tracking en cours.
+class _ThresholdHint extends StatelessWidget {
+  final bool zero;
+  final String zeroLabel;
+  const _ThresholdHint({required this.zero, required this.zeroLabel});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = zero ? AdminColors.warning : AdminColors.textSecondary;
+    return Padding(
+      padding: const EdgeInsets.only(top: 5, left: 2),
+      child: Row(children: [
+        Icon(zero ? Icons.warning_amber_rounded : Icons.info_outline, size: 11, color: color),
+        const SizedBox(width: 4),
+        Expanded(child: Text(zero ? zeroLabel : 'Valeur personnalisable',
+            style: TextStyle(color: color, fontSize: 11))),
+      ]),
+    );
+  }
+}
+
 class _MetricCard extends StatelessWidget {
   final String label;
   final String value;
@@ -918,7 +1083,8 @@ class _MetricCard extends StatelessWidget {
 
 class _ConfirmDialog extends StatelessWidget {
   final int total;
-  const _ConfirmDialog({required this.total});
+  final bool includesLive;
+  const _ConfirmDialog({required this.total, this.includesLive = false});
 
   @override
   Widget build(BuildContext context) {
@@ -932,14 +1098,34 @@ class _ConfirmDialog extends StatelessWidget {
         Text('Confirmer la purge',
             style: TextStyle(color: AdminColors.textPrimary, fontSize: 16)),
       ]),
-      content: RichText(text: TextSpan(
-        style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13, height: 1.6),
-        children: [
-          TextSpan(text: '$total éléments',
-              style: const TextStyle(color: AdminColors.danger, fontWeight: FontWeight.w600)),
-          const TextSpan(text: ' seront traités : sessions/positions orphelines et photos Storage supprimées définitivement, rides à safetySessionId orphelin réparés (conservés).\n\nLes suppressions sont irréversibles.'),
+      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        RichText(text: TextSpan(
+          style: const TextStyle(color: AdminColors.textSecondary, fontSize: 13, height: 1.6),
+          children: [
+            TextSpan(text: '$total éléments',
+                style: const TextStyle(color: AdminColors.danger, fontWeight: FontWeight.w600)),
+            const TextSpan(text: ' seront traités : sessions/positions orphelines et photos Storage supprimées définitivement, rides à safetySessionId orphelin réparés (conservés).\n\nLes suppressions sont irréversibles.'),
+          ],
+        )),
+        if (includesLive) ...[
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: AdminColors.warningDim,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: AdminColors.warning, width: 0.5)),
+            child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Icon(Icons.podcasts, color: AdminColors.warning, size: 15),
+              SizedBox(width: 8),
+              Expanded(child: Text(
+                'Seuil à 0 : un suivi encore actif entre dans le lot. La sortie en cours '
+                'perdrait son partage live et ses positions GPS déjà enregistrées.',
+                style: TextStyle(color: AdminColors.warning, fontSize: 12, height: 1.4),
+              )),
+            ]),
+          ),
         ],
-      )),
+      ]),
       actions: [
         TextButton(onPressed: () => Navigator.of(context).pop(false),
             child: const Text('Annuler', style: TextStyle(color: AdminColors.textSecondary))),
@@ -988,10 +1174,15 @@ class _IdentitiesPurgePanelState extends State<_IdentitiesPurgePanel> {
   Future<void> _load() async {
     setState(() { _loading = true; _error = null; });
     try {
+      if (!await AuthService.isServerAdmin()) {
+        setState(() => _error = _kNotAdminError);
+        return;
+      }
       final supabase = Supabase.instance.client;
-      final rides = await supabase.from('rides').select('user_id, started_at, ride_json');
+      final rides = await _fetchAllPages((f, t) =>
+          supabase.from('rides').select('user_id, started_at, ride_json').range(f, t));
       final map = <String, _Identity>{};
-      for (final r in (rides as List)) {
+      for (final r in rides) {
         final uid = r['user_id'] as String?;
         if (uid == null) continue;
         final id = map.putIfAbsent(uid, () => _Identity(uid));
@@ -1063,11 +1254,14 @@ class _IdentitiesPurgePanelState extends State<_IdentitiesPurgePanel> {
       int deletedRides = 0;
       for (final uid in _selected.toList()) {
         // 1. Sessions de cette identité (pour supprimer leurs positions d'abord).
-        final sessions = await supabase.from('safety_sessions').select('id').eq('user_id', uid);
-        final sessionIds = (sessions as List).map((s) => s['id'] as String).toList();
-        // 2. Positions rattachées (contrainte FK) — avant les sessions.
-        if (sessionIds.isNotEmpty) {
-          await supabase.from('safety_positions').delete().inFilter('session_id', sessionIds);
+        final sessions = await _fetchAllPages((f, t) =>
+            supabase.from('safety_sessions').select('id').eq('user_id', uid).range(f, t));
+        final sessionIds = sessions.map((s) => s['id'] as String).toList();
+        // 2. Positions rattachées (contrainte FK) — avant les sessions, par lots.
+        for (var i = 0; i < sessionIds.length; i += _kInChunk) {
+          final end = (i + _kInChunk < sessionIds.length) ? i + _kInChunk : sessionIds.length;
+          await supabase.from('safety_positions').delete()
+              .inFilter('session_id', sessionIds.sublist(i, end));
         }
         // 3. Sessions.
         await supabase.from('safety_sessions').delete().eq('user_id', uid);
@@ -1235,17 +1429,23 @@ class _NullSessionsPanelState extends State<_NullSessionsPanel> {
   Future<void> _load() async {
     setState(() { _loading = true; _error = null; });
     try {
+      if (!await AuthService.isServerAdmin()) {
+        setState(() => _error = _kNotAdminError);
+        return;
+      }
       final supabase = Supabase.instance.client;
-      final sessions = await supabase.from('safety_sessions').select('id').isFilter('user_id', null);
-      final ids = (sessions as List).map((s) => s['id'] as String).toList();
+      final sessions = await _fetchAllPages((f, t) =>
+          supabase.from('safety_sessions').select('id').isFilter('user_id', null).range(f, t));
+      final ids = sessions.map((s) => s['id'] as String).toList();
       var posCount = 0;
-      if (ids.isNotEmpty) {
+      for (var i = 0; i < ids.length; i += _kInChunk) {
+        final end = (i + _kInChunk < ids.length) ? i + _kInChunk : ids.length;
         final res = await supabase
             .from('safety_positions')
             .select('id')
-            .inFilter('session_id', ids)
+            .inFilter('session_id', ids.sublist(i, end))
             .count(CountOption.exact);
-        posCount = res.count;
+        posCount += res.count;
       }
       setState(() {
         _sessionIds = ids;
@@ -1294,12 +1494,10 @@ class _NullSessionsPanelState extends State<_NullSessionsPanel> {
       final supabase = Supabase.instance.client;
       // 1. Positions rattachées (contrainte FK) — par lots pour éviter une
       //    liste d'IDs trop longue dans le filtre.
-      if (_sessionIds.isNotEmpty) {
-        const chunk = 100;
-        for (var i = 0; i < _sessionIds.length; i += chunk) {
-          final end = (i + chunk < _sessionIds.length) ? i + chunk : _sessionIds.length;
-          await supabase.from('safety_positions').delete().inFilter('session_id', _sessionIds.sublist(i, end));
-        }
+      for (var i = 0; i < _sessionIds.length; i += _kInChunk) {
+        final end = (i + _kInChunk < _sessionIds.length) ? i + _kInChunk : _sessionIds.length;
+        await supabase.from('safety_positions').delete()
+            .inFilter('session_id', _sessionIds.sublist(i, end));
       }
       // 2. Sessions à user_id NULL.
       final deleted = await supabase.from('safety_sessions').delete().isFilter('user_id', null).select('id');
